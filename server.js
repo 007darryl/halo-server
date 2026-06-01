@@ -21,7 +21,7 @@ app.post('/chat', async (req, res) => {
         'anthropic-version': '2023-06-01'
       },
       body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
+        model: 'claude-sonnet-4-5',
         max_tokens: 1500,
         system: req.body.system || 'You are HALO, a helpful AI assistant.',
         messages: req.body.messages || []
