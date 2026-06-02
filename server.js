@@ -138,6 +138,30 @@ Caption should be 1-3 lines max. Bold, confident, faith-driven, luxury streetwea
   }
 });
 
+app.post('/post-content', async (req, res) => {
+  try {
+    const { description, image_url, platforms } = req.body;
+    
+    const webhookUrl = process.env.MAKE_WEBHOOK_URL;
+    if (!webhookUrl) return res.status(400).json({ error: 'No webhook configured' });
+
+    const response = await fetch(webhookUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        description: description || '',
+        image_url: image_url || '',
+        platforms: platforms || 'Instagram, TikTok, Pinterest'
+      })
+    });
+
+    const text = await response.text();
+    res.json({ success: true, message: 'Content queued for posting', response: text });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get('/', (req, res) => res.send('HALO Server Online'));
 
 const PORT = process.env.PORT || 3000;
