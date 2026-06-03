@@ -7,6 +7,38 @@ app.use(express.json());
 
 const VOICE_ID = 'QYrOVogqhHWUzdZFXf0E';
 
+// Saved HALO places.
+// Update these later with exact addresses if you want more precision.
+const SAVED_PLACES = {
+  home: 'Sylmar, CA',
+  work: 'Santa Clarita, CA',
+  gym: 'Planet Fitness, Sylmar, CA',
+  planetfitness: 'Planet Fitness, Sylmar, CA',
+  lax: 'Los Angeles International Airport',
+  beach: 'Santa Monica Pier',
+  santamonica: 'Santa Monica Pier',
+  dodgers: 'Dodger Stadium',
+  dodgerstadium: 'Dodger Stadium'
+};
+
+function resolvePlaceName(value) {
+  if (!value) return value;
+  const raw = String(value).trim();
+  const key = raw.toLowerCase().replace(/[^a-z0-9]/g, '');
+  return SAVED_PLACES[key] || raw;
+}
+
+function parseGoogleSeconds(value) {
+  return parseInt(String(value || '0s').replace('s', ''), 10) || 0;
+}
+
+function trafficLevelFromDelay(delaySeconds) {
+  if (delaySeconds >= 1200) return 'Heavy';
+  if (delaySeconds >= 600) return 'Moderate';
+  if (delaySeconds >= 180) return 'Light';
+  return 'Clear';
+}
+
 // ── DROPBOX: Search for file and get direct image URL ──
 async function findDropboxFile(searchTerm) {
   const token = process.env.DROPBOX_TOKEN;
@@ -320,10 +352,36 @@ Caption: 1-3 lines, bold, faith-driven, luxury streetwear. Max 2 emojis. 25 hash
   }
 });
 
+// ── GOOGLE GEOCODING HELPER ──
+async function geocodeAddress(address) {
+  const apiKey = process.env.GOOGLE_MAPS_API_KEY;
+  const resolved = resolvePlaceName(address);
+
+  const url = new URL('https://maps.googleapis.com/maps/api/geocode/json');
+  url.searchParams.set('address', resolved);
+  url.searchParams.set('key', apiKey);
+
+  const response = await fetch(url);
+  const data = await response.json();
+
+  if (data.status !== 'OK' || !data.results?.[0]) {
+    throw new Error(`Geocoding failed for ${resolved}: ${data.status || 'UNKNOWN'}`);
+  }
+
+  const result = data.results[0];
+
+  return {
+    query: address,
+    resolved,
+    formatted_address: result.formatted_address,
+    location: result.geometry.location
+  };
+}
+
 // ── ROUTE INTEL — Google Routes API ──
 app.post('/route-intel', async (req, res) => {
   try {
-    const { origin = 'Sylmar, CA', destination } = req.body;
+    const { origin = 'Sylmar, CA', destination, alternatives = true } = req.body;
 
     if (!process.env.GOOGLE_MAPS_API_KEY) {
       return res.status(500).json({
@@ -335,19 +393,31 @@ app.post('/route-intel', async (req, res) => {
       return res.status(400).json({ error: 'Destination is required' });
     }
 
+    const resolvedOrigin = resolvePlaceName(origin);
+    const resolvedDestination = resolvePlaceName(destination);
+
     const response = await fetch('https://routes.googleapis.com/directions/v2:computeRoutes', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'X-Goog-Api-Key': process.env.GOOGLE_MAPS_API_KEY,
-        'X-Goog-FieldMask': 'routes.duration,routes.staticDuration,routes.distanceMeters,routes.description'
+        'X-Goog-FieldMask': [
+          'routes.duration',
+          'routes.staticDuration',
+          'routes.distanceMeters',
+          'routes.description',
+          'routes.polyline.encodedPolyline',
+          'routes.legs.startLocation',
+          'routes.legs.endLocation',
+          'routes.routeLabels'
+        ].join(',')
       },
       body: JSON.stringify({
-        origin: { address: origin },
-        destination: { address: destination },
+        origin: { address: resolvedOrigin },
+        destination: { address: resolvedDestination },
         travelMode: 'DRIVE',
         routingPreference: 'TRAFFIC_AWARE_OPTIMAL',
-        computeAlternativeRoutes: false
+        computeAlternativeRoutes: Boolean(alternatives)
       })
     });
 
@@ -358,36 +428,213 @@ app.post('/route-intel', async (req, res) => {
       return res.status(response.status).json(data);
     }
 
-    const route = data.routes?.[0];
+    const routes = data.routes || [];
 
-    if (!route) {
+    if (!routes.length) {
       return res.status(404).json({ error: 'No route found' });
     }
 
-    const trafficSeconds = parseInt((route.duration || '0s').replace('s', ''), 10);
-    const normalSeconds = parseInt((route.staticDuration || '0s').replace('s', ''), 10);
-    const delaySeconds = Math.max(trafficSeconds - normalSeconds, 0);
+    const formattedRoutes = routes.map((route, index) => {
+      const trafficSeconds = parseGoogleSeconds(route.duration);
+      const normalSeconds = parseGoogleSeconds(route.staticDuration);
+      const delaySeconds = Math.max(trafficSeconds - normalSeconds, 0);
+      const endLocation = route.legs?.[0]?.endLocation?.latLng || null;
+      const startLocation = route.legs?.[0]?.startLocation?.latLng || null;
+
+      return {
+        route_index: index,
+        label: index === 0 ? 'Recommended' : `Option ${index + 1}`,
+        description: route.description || (index === 0 ? 'Best available route' : `Alternative route ${index + 1}`),
+        eta_minutes: Math.round(trafficSeconds / 60),
+        normal_minutes: Math.round(normalSeconds / 60),
+        delay_minutes: Math.round(delaySeconds / 60),
+        distance_miles: Number((route.distanceMeters / 1609.34).toFixed(1)),
+        traffic_level: trafficLevelFromDelay(delaySeconds),
+        polyline: route.polyline?.encodedPolyline || null,
+        start_location: startLocation,
+        end_location: endLocation,
+        route_labels: route.routeLabels || []
+      };
+    });
+
+    const primary = formattedRoutes[0];
 
     res.json({
       success: true,
-      origin,
-      destination,
-      eta_minutes: Math.round(trafficSeconds / 60),
-      normal_minutes: Math.round(normalSeconds / 60),
-      delay_minutes: Math.round(delaySeconds / 60),
-      distance_miles: Number((route.distanceMeters / 1609.34).toFixed(1)),
-      traffic_level:
-        delaySeconds >= 1200 ? 'Heavy' :
-        delaySeconds >= 600 ? 'Moderate' :
-        delaySeconds >= 180 ? 'Light' :
-        'Clear',
-      summary: route.description || 'Best available route'
+      origin: resolvedOrigin,
+      destination: resolvedDestination,
+      requested_origin: origin,
+      requested_destination: destination,
+      ...primary,
+      routes: formattedRoutes
     });
 
   } catch (error) {
     console.error('ROUTE INTEL ERROR:', error.message);
     res.status(500).json({ error: error.message });
   }
+});
+
+// ── PLACES NEARBY — Gas / Parking / Useful Stops ──
+app.post('/places-nearby', async (req, res) => {
+  try {
+    const { destination, location, type = 'gas', radius = 2500, max_results = 8 } = req.body;
+
+    if (!process.env.GOOGLE_MAPS_API_KEY) {
+      return res.status(500).json({
+        error: 'Missing GOOGLE_MAPS_API_KEY in Render environment variables'
+      });
+    }
+
+    let center = location;
+
+    if (!center && destination) {
+      const geo = await geocodeAddress(destination);
+      center = {
+        latitude: geo.location.lat,
+        longitude: geo.location.lng
+      };
+    }
+
+    if (!center?.latitude || !center?.longitude) {
+      return res.status(400).json({
+        error: 'Provide destination or location {latitude, longitude}'
+      });
+    }
+
+    const includedType =
+      String(type).toLowerCase().includes('park') ? 'parking' :
+      String(type).toLowerCase().includes('gas') ? 'gas_station' :
+      'gas_station';
+
+    const response = await fetch('https://places.googleapis.com/v1/places:searchNearby', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Goog-Api-Key': process.env.GOOGLE_MAPS_API_KEY,
+        'X-Goog-FieldMask': [
+          'places.id',
+          'places.displayName',
+          'places.formattedAddress',
+          'places.location',
+          'places.rating',
+          'places.googleMapsUri',
+          'places.types'
+        ].join(',')
+      },
+      body: JSON.stringify({
+        includedTypes: [includedType],
+        maxResultCount: Math.min(Number(max_results) || 8, 20),
+        locationRestriction: {
+          circle: {
+            center,
+            radius: Math.min(Number(radius) || 2500, 50000)
+          }
+        }
+      })
+    });
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      console.error('GOOGLE PLACES ERROR:', JSON.stringify(data));
+      return res.status(response.status).json(data);
+    }
+
+    const places = (data.places || []).map(place => ({
+      id: place.id,
+      name: place.displayName?.text || 'Unknown place',
+      address: place.formattedAddress || '',
+      rating: place.rating || null,
+      location: place.location || null,
+      google_maps_url: place.googleMapsUri || null,
+      types: place.types || []
+    }));
+
+    res.json({
+      success: true,
+      type: includedType,
+      center,
+      count: places.length,
+      places
+    });
+
+  } catch (error) {
+    console.error('PLACES NEARBY ERROR:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ── ROUTE PLUS — Route + Gas + Parking in one call ──
+app.post('/route-plus', async (req, res) => {
+  try {
+    const { origin = 'Sylmar, CA', destination } = req.body;
+
+    if (!destination) {
+      return res.status(400).json({ error: 'Destination is required' });
+    }
+
+    const routeResp = await fetch(`${req.protocol}://${req.get('host')}/route-intel`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ origin, destination, alternatives: true })
+    });
+
+    const routeData = await routeResp.json();
+
+    if (!routeResp.ok || !routeData.success) {
+      return res.status(routeResp.status).json(routeData);
+    }
+
+    const end = routeData.end_location;
+    const center = end ? {
+      latitude: end.latitude,
+      longitude: end.longitude
+    } : null;
+
+    let gas = [];
+    let parking = [];
+
+    if (center) {
+      const [gasResp, parkingResp] = await Promise.all([
+        fetch(`${req.protocol}://${req.get('host')}/places-nearby`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ location: center, type: 'gas', radius: 3500, max_results: 5 })
+        }),
+        fetch(`${req.protocol}://${req.get('host')}/places-nearby`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ location: center, type: 'parking', radius: 2500, max_results: 5 })
+        })
+      ]);
+
+      const gasData = await gasResp.json();
+      const parkingData = await parkingResp.json();
+
+      gas = gasData.places || [];
+      parking = parkingData.places || [];
+    }
+
+    res.json({
+      success: true,
+      route: routeData,
+      gas,
+      parking
+    });
+
+  } catch (error) {
+    console.error('ROUTE PLUS ERROR:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ── SAVED PLACES ──
+app.get('/saved-places', (req, res) => {
+  res.json({
+    success: true,
+    saved_places: SAVED_PLACES
+  });
 });
 
 app.get('/', (req, res) => res.send('HALO Server Online'));
