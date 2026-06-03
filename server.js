@@ -10,20 +10,41 @@ const DROPBOX_FOLDER = '/Omkeer Content';
 
 // ── DROPBOX: Search for file and get direct image URL ──
 async function findDropboxFile(searchTerm) {
+  // Check token
   const token = process.env.DROPBOX_TOKEN;
-  if (!token) return { name: null, url: null };
+  console.log('DROPBOX TOKEN EXISTS:', !!token);
+  if (!token) {
+    console.error('DROPBOX ERROR: No token found in environment variables');
+    return { name: null, url: null };
+  }
+
+  const FOLDER = '/Omkeer Content';
+  console.log('SEARCHING DROPBOX FOLDER:', FOLDER);
+  console.log('SEARCHING FILENAME:', searchTerm);
 
   try {
-    // List all files in the Omkeer Content folder
+    // List folder
     const listResp = await fetch('https://api.dropboxapi.com/2/files/list_folder', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-      body: JSON.stringify({ path: DROPBOX_FOLDER, recursive: false })
+      body: JSON.stringify({ path: FOLDER, recursive: false })
     });
+    const listText = await listResp.text();
+    console.log('LIST FOLDER STATUS:', listResp.status);
+    console.log('LIST FOLDER RAW:', listText.substring(0, 500));
 
-    const listData = await listResp.json();
-    if (!listData.entries) return { name: null, url: null };
+    let listData;
+    try { listData = JSON.parse(listText); }
+    catch(e) { console.error('DROPBOX ERROR: Could not parse list_folder response'); return { name: null, url: null }; }
 
+    if (!listData.entries) {
+      console.error('DROPBOX ERROR: No entries in folder response:', JSON.stringify(listData));
+      return { name: null, url: null };
+    }
+
+    console.log('FILES IN FOLDER:', listData.entries.map(e => e.name));
+
+    // Fuzzy match
     const normalize = s => s.toLowerCase().replace(/[-_.\s]+/g, ' ').trim();
     const search = normalize(searchTerm);
     const entries = listData.entries;
@@ -32,40 +53,41 @@ async function findDropboxFile(searchTerm) {
       || entries.find(e => normalize(e.name).includes(search))
       || entries.find(e => {
           const words = search.split(' ').filter(w => w.length > 2);
-          return words.every(w => normalize(e.name).includes(w));
+          return words.length > 0 && words.every(w => normalize(e.name).includes(w));
         })
       || entries.find(e => {
           const words = search.split(' ').filter(w => w.length > 2);
           return words.some(w => normalize(e.name).includes(w));
         });
 
+    console.log('DROPBOX FILE MATCH:', match ? match.name : 'NO MATCH FOUND');
     if (!match) return { name: null, url: null };
 
-    console.log('Found file:', match.name, 'path:', match.path_lower);
+    // Get temporary link
+    console.log('Requesting temp link for path:', match.path_lower);
+    const tlResp = await fetch('https://api.dropboxapi.com/2/files/get_temporary_link', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+      body: JSON.stringify({ path: match.path_lower })
+    });
+    const tlText = await tlResp.text();
+    console.log('DROPBOX TEMP LINK STATUS:', tlResp.status);
+    console.log('DROPBOX TEMP LINK RESPONSE:', tlText.substring(0, 400));
 
-    // Use Dropbox temporary download link - works with files.content.read permission
-    try {
-      console.log('Requesting temporary link for path:', match.path_lower);
-      const dlResp = await fetch('https://api.dropboxapi.com/2/files/get_temporary_link', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-        body: JSON.stringify({ path: match.path_lower })
-      });
-      const dlText = await dlResp.text();
-      console.log('get_temporary_link raw response:', dlText.substring(0, 300));
-      const dlData = JSON.parse(dlText);
-      if (dlData.link) {
-        console.log('Got temporary download link:', dlData.link.substring(0, 60));
-        return { name: match.name, url: dlData.link };
-      }
-      console.log('No link in response:', JSON.stringify(dlData));
-    } catch(e) { console.log('get_temporary_link error:', e.message); }
+    let tlData;
+    try { tlData = JSON.parse(tlText); }
+    catch(e) { console.error('DROPBOX ERROR: Could not parse temp link response'); return { name: match.name, url: null }; }
 
-    // Fallback — return just the name without URL
+    if (tlData.link) {
+      console.log('RESOLVED IMAGE URL:', tlData.link.substring(0, 80));
+      return { name: match.name, url: tlData.link };
+    }
+
+    console.error('DROPBOX ERROR: No link in response:', JSON.stringify(tlData));
     return { name: match.name, url: null };
 
   } catch (error) {
-    console.log('Dropbox search error:', error.message);
+    console.error('DROPBOX ERROR:', error.message);
     return { name: null, url: null };
   }
 }
