@@ -8,59 +8,86 @@ app.use(express.json());
 const VOICE_ID = 'QYrOVogqhHWUzdZFXf0E';
 const DROPBOX_FOLDER = '/Omkeer Content';
 
-// ── DROPBOX: Search for a file by fuzzy name ──
+// ── DROPBOX: Search for file and get direct image URL ──
 async function findDropboxFile(searchTerm) {
   const token = process.env.DROPBOX_TOKEN;
-  if (!token) return null;
+  if (!token) return { name: null, url: null };
 
   try {
     // List all files in the Omkeer Content folder
-    const response = await fetch('https://api.dropboxapi.com/2/files/list_folder', {
+    const listResp = await fetch('https://api.dropboxapi.com/2/files/list_folder', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${token}`
-      },
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
       body: JSON.stringify({ path: DROPBOX_FOLDER, recursive: false })
     });
 
-    const data = await response.json();
-    if (!data.entries) return null;
+    const listData = await listResp.json();
+    if (!listData.entries) return { name: null, url: null };
 
-    // Fuzzy match: normalize both search term and filenames
-    const normalize = s => s.toLowerCase().replace(/[-_\s]+/g, ' ').trim();
+    const normalize = s => s.toLowerCase().replace(/[-_.\s]+/g, ' ').trim();
     const search = normalize(searchTerm);
+    const entries = listData.entries;
 
-    // Try exact match first
-    let match = data.entries.find(e => normalize(e.name) === search);
+    let match = entries.find(e => normalize(e.name) === search)
+      || entries.find(e => normalize(e.name).includes(search))
+      || entries.find(e => {
+          const words = search.split(' ').filter(w => w.length > 2);
+          return words.every(w => normalize(e.name).includes(w));
+        })
+      || entries.find(e => {
+          const words = search.split(' ').filter(w => w.length > 2);
+          return words.some(w => normalize(e.name).includes(w));
+        });
 
-    // Then partial match
-    if (!match) {
-      match = data.entries.find(e => normalize(e.name).includes(search));
-    }
+    if (!match) return { name: null, url: null };
 
-    // Then word-by-word match
-    if (!match) {
-      const searchWords = search.split(' ').filter(w => w.length > 2);
-      match = data.entries.find(e => {
-        const fname = normalize(e.name);
-        return searchWords.every(w => fname.includes(w));
+    console.log('Found file:', match.name, 'path:', match.path_lower);
+
+    // Try to get existing shared link first
+    try {
+      const existResp = await fetch('https://api.dropboxapi.com/2/sharing/list_shared_links', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+        body: JSON.stringify({ path: match.path_lower, direct_only: true })
       });
-    }
+      const existData = await existResp.json();
+      if (existData.links && existData.links.length > 0) {
+        // Convert to direct download URL
+        const url = existData.links[0].url.replace('www.dropbox.com', 'dl.dropboxusercontent.com').replace('?dl=0', '').replace('dl=0', '');
+        console.log('Using existing shared link:', url);
+        return { name: match.name, url };
+      }
+    } catch(e) { console.log('list_shared_links error:', e.message); }
 
-    // Then any word match
-    if (!match) {
-      const searchWords = search.split(' ').filter(w => w.length > 2);
-      match = data.entries.find(e => {
-        const fname = normalize(e.name);
-        return searchWords.some(w => fname.includes(w));
+    // Create new shared link
+    try {
+      const createResp = await fetch('https://api.dropboxapi.com/2/sharing/create_shared_link_with_settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+        body: JSON.stringify({ path: match.path_lower, settings: { requested_visibility: 'public', audience: 'public', access: 'viewer' } })
       });
-    }
+      const createData = await createResp.json();
+      if (createData.url) {
+        const url = createData.url.replace('www.dropbox.com', 'dl.dropboxusercontent.com').replace('?dl=0', '').replace('dl=0', '');
+        console.log('Created new shared link:', url);
+        return { name: match.name, url };
+      }
+      // Handle already exists error
+      if (createData.error && createData.error['.tag'] === 'shared_link_already_exists') {
+        const existing = createData.error.shared_link_already_exists;
+        if (existing && existing.metadata && existing.metadata.url) {
+          const url = existing.metadata.url.replace('www.dropbox.com', 'dl.dropboxusercontent.com').replace('?dl=0', '');
+          return { name: match.name, url };
+        }
+      }
+    } catch(e) { console.log('create_shared_link error:', e.message); }
 
-    return match ? match.name : null;
+    // Fallback — return just the name without URL
+    return { name: match.name, url: null };
+
   } catch (error) {
     console.log('Dropbox search error:', error.message);
-    return null;
+    return { name: null, url: null };
   }
 }
 
@@ -132,15 +159,17 @@ app.post('/post-content', async (req, res) => {
 
     // If filename provided, search Dropbox for it
     let resolvedFilename = filename || null;
+    let resolvedUrl = null;
+
     if (filename) {
       console.log('Searching Dropbox for:', filename);
-      const found = await findDropboxFile(filename);
-      if (found) {
-        resolvedFilename = found;
-        console.log('Found Dropbox file:', found);
+      const result = await findDropboxFile(filename);
+      if (result.name) {
+        resolvedFilename = result.name;
+        resolvedUrl = result.url;
+        console.log('Found:', resolvedFilename, 'URL:', resolvedUrl);
       } else {
-        console.log('No Dropbox match found for:', filename);
-        // Still send with original filename as fallback
+        console.log('No match found for:', filename);
         resolvedFilename = filename;
       }
     }
@@ -148,6 +177,7 @@ app.post('/post-content', async (req, res) => {
     const payload = {
       description: description || resolvedFilename || '',
       filename: resolvedFilename || '',
+      image_url: resolvedUrl || '',
       platforms: platforms || 'Instagram, TikTok, Pinterest'
     };
 
@@ -160,7 +190,7 @@ app.post('/post-content', async (req, res) => {
     });
 
     const text = await response.text();
-    res.json({ success: true, message: 'Content queued', filename: resolvedFilename, response: text });
+    res.json({ success: true, message: 'Content queued', filename: resolvedFilename, url: resolvedUrl, response: text });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
