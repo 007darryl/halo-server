@@ -151,6 +151,7 @@ app.post('/speak', async (req, res) => {
 
 // ── POST CONTENT — with Dropbox file search ──
 app.post('/post-content', async (req, res) => {
+  console.log('POST COMMAND TRIGGERED');
   try {
     const webhookUrl = process.env.MAKE_WEBHOOK_URL;
     if (!webhookUrl) return res.status(400).json({ error: 'No webhook configured' });
@@ -183,6 +184,7 @@ app.post('/post-content', async (req, res) => {
 
     console.log('Sending to Make.com:', payload);
 
+    console.log('Sending to Make.com:', payload);
     const response = await fetch(webhookUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
