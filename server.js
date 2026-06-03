@@ -43,44 +43,20 @@ async function findDropboxFile(searchTerm) {
 
     console.log('Found file:', match.name, 'path:', match.path_lower);
 
-    // Try to get existing shared link first
+    // Use Dropbox temporary download link - works with files.content.read permission
     try {
-      const existResp = await fetch('https://api.dropboxapi.com/2/sharing/list_shared_links', {
+      const dlResp = await fetch('https://api.dropboxapi.com/2/files/get_temporary_link', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-        body: JSON.stringify({ path: match.path_lower, direct_only: true })
+        body: JSON.stringify({ path: match.path_lower })
       });
-      const existData = await existResp.json();
-      if (existData.links && existData.links.length > 0) {
-        // Convert to direct download URL
-        const url = existData.links[0].url.replace('www.dropbox.com', 'dl.dropboxusercontent.com').replace('?dl=0', '').replace('dl=0', '');
-        console.log('Using existing shared link:', url);
-        return { name: match.name, url };
+      const dlData = await dlResp.json();
+      if (dlData.link) {
+        console.log('Got temporary download link');
+        return { name: match.name, url: dlData.link };
       }
-    } catch(e) { console.log('list_shared_links error:', e.message); }
-
-    // Create new shared link
-    try {
-      const createResp = await fetch('https://api.dropboxapi.com/2/sharing/create_shared_link_with_settings', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-        body: JSON.stringify({ path: match.path_lower, settings: { requested_visibility: 'public', audience: 'public', access: 'viewer' } })
-      });
-      const createData = await createResp.json();
-      if (createData.url) {
-        const url = createData.url.replace('www.dropbox.com', 'dl.dropboxusercontent.com').replace('?dl=0', '').replace('dl=0', '');
-        console.log('Created new shared link:', url);
-        return { name: match.name, url };
-      }
-      // Handle already exists error
-      if (createData.error && createData.error['.tag'] === 'shared_link_already_exists') {
-        const existing = createData.error.shared_link_already_exists;
-        if (existing && existing.metadata && existing.metadata.url) {
-          const url = existing.metadata.url.replace('www.dropbox.com', 'dl.dropboxusercontent.com').replace('?dl=0', '');
-          return { name: match.name, url };
-        }
-      }
-    } catch(e) { console.log('create_shared_link error:', e.message); }
+      console.log('get_temporary_link response:', JSON.stringify(dlData).substring(0, 200));
+    } catch(e) { console.log('get_temporary_link error:', e.message); }
 
     // Fallback — return just the name without URL
     return { name: match.name, url: null };
