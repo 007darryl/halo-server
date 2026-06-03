@@ -126,8 +126,21 @@ app.post('/speak', async (req, res) => {
 });
 
 // ── POST CONTENT — with Dropbox file search ──
+// Simple deduplication map
+const recentPosts = new Map();
+
 app.post('/post-content', async (req, res) => {
   console.log('POST COMMAND TRIGGERED');
+  
+  // Deduplicate — ignore same filename within 3 seconds
+  const key = (req.body.filename||req.body.description||'').toLowerCase().trim();
+  const now = Date.now();
+  if(recentPosts.has(key) && now - recentPosts.get(key) < 3000){
+    console.log('DUPLICATE IGNORED:', key);
+    return res.json({ success: true, message: 'Duplicate ignored', filename: key });
+  }
+  recentPosts.set(key, now);
+  setTimeout(()=>recentPosts.delete(key), 5000);
   try {
     const webhookUrl = process.env.MAKE_WEBHOOK_URL;
     if (!webhookUrl) return res.status(400).json({ error: 'No webhook configured' });
