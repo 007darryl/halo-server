@@ -45,17 +45,20 @@ async function findDropboxFile(searchTerm) {
 
     // Use Dropbox temporary download link - works with files.content.read permission
     try {
+      console.log('Requesting temporary link for path:', match.path_lower);
       const dlResp = await fetch('https://api.dropboxapi.com/2/files/get_temporary_link', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
         body: JSON.stringify({ path: match.path_lower })
       });
-      const dlData = await dlResp.json();
+      const dlText = await dlResp.text();
+      console.log('get_temporary_link raw response:', dlText.substring(0, 300));
+      const dlData = JSON.parse(dlText);
       if (dlData.link) {
-        console.log('Got temporary download link');
+        console.log('Got temporary download link:', dlData.link.substring(0, 60));
         return { name: match.name, url: dlData.link };
       }
-      console.log('get_temporary_link response:', JSON.stringify(dlData).substring(0, 200));
+      console.log('No link in response:', JSON.stringify(dlData));
     } catch(e) { console.log('get_temporary_link error:', e.message); }
 
     // Fallback — return just the name without URL
@@ -173,15 +176,19 @@ app.post('/post-content', async (req, res) => {
 
     console.log('Sending to Make.com:', payload);
 
-    console.log('Sending to Make.com:', payload);
-    const response = await fetch(webhookUrl, {
+    // Respond to HALO immediately — don't wait for Make.com
+    res.json({ success: true, message: 'Content queued', filename: resolvedFilename, url: resolvedUrl });
+
+    // Send to Make.com in background — no timeout issues
+    fetch(webhookUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
+    }).then(r => r.text()).then(t => {
+      console.log('Make.com response:', t);
+    }).catch(e => {
+      console.log('Make.com error:', e.message);
     });
-
-    const text = await response.text();
-    res.json({ success: true, message: 'Content queued', filename: resolvedFilename, url: resolvedUrl, response: text });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
