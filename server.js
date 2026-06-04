@@ -6,117 +6,97 @@ app.use(cors());
 app.use(express.json());
 
 const VOICE_ID = 'QYrOVogqhHWUzdZFXf0E';
+const DROPBOX_FOLDER = '/Omkeer Content';
 
-// Saved HALO places.
-// Update these later with exact addresses if you want more precision.
-const SAVED_PLACES = {
-  home: 'Sylmar, CA',
-  work: 'Santa Clarita, CA',
-  gym: 'Planet Fitness, Sylmar, CA',
-  planetfitness: 'Planet Fitness, Sylmar, CA',
-  lax: 'Los Angeles International Airport',
-  beach: 'Santa Monica Pier',
-  santamonica: 'Santa Monica Pier',
-  dodgers: 'Dodger Stadium',
-  dodgerstadium: 'Dodger Stadium',
-  downtown: 'Downtown Los Angeles, CA',
-  dtla: 'Downtown Los Angeles, CA',
-  hollywood: 'Hollywood, Los Angeles, CA'
-};
-
-function resolvePlaceName(value) {
-  if (!value) return value;
-  const raw = String(value).trim();
-  const key = raw.toLowerCase().replace(/[^a-z0-9]/g, '');
-  return SAVED_PLACES[key] || raw;
-}
-
-function parseGoogleSeconds(value) {
-  return parseInt(String(value || '0s').replace('s', ''), 10) || 0;
-}
-
-function trafficLevelFromDelay(delaySeconds) {
-  if (delaySeconds >= 1200) return 'Heavy';
-  if (delaySeconds >= 600) return 'Moderate';
-  if (delaySeconds >= 180) return 'Light';
-  return 'Clear';
-}
-
-function metersToMiles(meters) {
-  return Number((Number(meters || 0) / 1609.34).toFixed(1));
-}
-
-function stripHtml(value) {
-  return String(value || '').replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
-}
-
-function formatUnixTime(seconds) {
-  if (!seconds) return null;
-  return new Date(Number(seconds) * 1000).toISOString();
-}
-
-// ── DROPBOX: Search for file and get direct image URL ──
+// ── DROPBOX: Full pipeline with fallback chain ──
 async function findDropboxFile(searchTerm) {
   const token = process.env.DROPBOX_TOKEN;
+
+  console.log('=== DROPBOX PIPELINE START ===');
   console.log('DROPBOX TOKEN EXISTS:', !!token);
+  console.log('TOKEN LENGTH:', token ? token.length : 0);
+  console.log('SEARCH TERM:', searchTerm);
 
   if (!token) {
-    console.error('DROPBOX ERROR: No token found in environment variables');
-    return { name: null, url: null };
+    return { name: null, url: null, error: 'No DROPBOX_TOKEN in environment variables' };
   }
 
-  const FOLDER = '/Omkeer Content';
-  console.log('SEARCHING DROPBOX FOLDER:', FOLDER);
-  console.log('SEARCHING FILENAME:', searchTerm);
-
   try {
+    // ── STEP 1: List folder ──
+    console.log('STEP 1: Listing folder:', DROPBOX_FOLDER);
     const listResp = await fetch('https://api.dropboxapi.com/2/files/list_folder', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${token}`
       },
-      body: JSON.stringify({ path: FOLDER, recursive: false })
+      body: JSON.stringify({ path: DROPBOX_FOLDER, recursive: false })
     });
 
     const listText = await listResp.text();
     console.log('LIST FOLDER STATUS:', listResp.status);
-    console.log('LIST FOLDER RAW:', listText.substring(0, 500));
+
+    if (listResp.status === 401) {
+      console.error('DROPBOX ERROR: Token expired or invalid — regenerate at dropbox.com/developers');
+      return { name: null, url: null, error: 'Dropbox token expired. Regenerate at dropbox.com/developers and update DROPBOX_TOKEN in Render.' };
+    }
+
+    if (listResp.status !== 200) {
+      console.error('LIST FOLDER ERROR:', listText.substring(0, 300));
+      return { name: null, url: null, error: `Dropbox list_folder failed with status ${listResp.status}: ${listText.substring(0, 200)}` };
+    }
 
     let listData;
-    try {
-      listData = JSON.parse(listText);
-    } catch (e) {
-      console.error('DROPBOX ERROR: Could not parse list_folder response');
-      return { name: null, url: null };
+    try { listData = JSON.parse(listText); }
+    catch(e) {
+      console.error('DROPBOX ERROR: Cannot parse list_folder response');
+      return { name: null, url: null, error: 'Cannot parse Dropbox response' };
     }
 
-    if (!listData.entries) {
-      console.error('DROPBOX ERROR: No entries in folder response:', JSON.stringify(listData));
-      return { name: null, url: null };
+    if (!listData.entries || listData.entries.length === 0) {
+      console.error('DROPBOX ERROR: Folder is empty or no entries returned');
+      return { name: null, url: null, error: 'Dropbox folder is empty or inaccessible' };
     }
 
-    console.log('FILES IN FOLDER:', listData.entries.map(e => e.name));
+    const fileNames = listData.entries.map(e => e.name);
+    console.log('FILES IN FOLDER:', fileNames);
 
+    // ── STEP 2: Fuzzy match ──
+    console.log('STEP 2: Fuzzy matching:', searchTerm);
     const normalize = s => s.toLowerCase().replace(/[-_.\s]+/g, ' ').trim();
+    // Strip file extension for matching
+    const normalizeNoExt = s => normalize(s).replace(/\.(jpg|jpeg|png|gif|mp4|mov|webp|heic)$/i, '');
     const search = normalize(searchTerm);
     const entries = listData.entries;
 
-    let match = entries.find(e => normalize(e.name) === search)
-      || entries.find(e => normalize(e.name).includes(search))
-      || entries.find(e => {
+    let match =
+      // 1. Exact match (with or without extension)
+      entries.find(e => normalize(e.name) === search) ||
+      entries.find(e => normalizeNoExt(e.name) === search) ||
+      // 2. Partial contains
+      entries.find(e => normalize(e.name).includes(search)) ||
+      entries.find(e => normalizeNoExt(e.name).includes(search)) ||
+      // 3. All words match
+      entries.find(e => {
         const words = search.split(' ').filter(w => w.length > 2);
-        return words.length > 0 && words.every(w => normalize(e.name).includes(w));
-      })
-      || entries.find(e => {
+        return words.length > 0 && words.every(w => normalizeNoExt(e.name).includes(w));
+      }) ||
+      // 4. Any word match
+      entries.find(e => {
         const words = search.split(' ').filter(w => w.length > 2);
-        return words.some(w => normalize(e.name).includes(w));
+        return words.some(w => normalizeNoExt(e.name).includes(w));
       });
 
-    console.log('DROPBOX FILE MATCH:', match ? match.name : 'NO MATCH FOUND');
+    if (!match) {
+      console.error('DROPBOX ERROR: No file matched search term:', search);
+      console.error('Available files:', fileNames);
+      return { name: null, url: null, error: `No file matching "${searchTerm}" found in Dropbox. Available files: ${fileNames.join(', ')}` };
+    }
 
-    if (!match) return { name: null, url: null };
+    console.log('DROPBOX FILE MATCH:', match.name, 'path:', match.path_lower);
 
+    // ── STEP 3: Get temporary link ──
+    console.log('STEP 3: Getting temporary download link for:', match.path_lower);
     const tlResp = await fetch('https://api.dropboxapi.com/2/files/get_temporary_link', {
       method: 'POST',
       headers: {
@@ -127,28 +107,93 @@ async function findDropboxFile(searchTerm) {
     });
 
     const tlText = await tlResp.text();
-    console.log('DROPBOX TEMP LINK STATUS:', tlResp.status);
-    console.log('DROPBOX TEMP LINK RESPONSE:', tlText.substring(0, 400));
+    console.log('TEMP LINK STATUS:', tlResp.status);
+    console.log('TEMP LINK RESPONSE:', tlText.substring(0, 400));
+
+    if (tlResp.status === 401) {
+      return { name: match.name, url: null, error: 'Dropbox token expired on get_temporary_link call' };
+    }
 
     let tlData;
-    try {
-      tlData = JSON.parse(tlText);
-    } catch (e) {
-      console.error('DROPBOX ERROR: Could not parse temp link response');
-      return { name: match.name, url: null };
+    try { tlData = JSON.parse(tlText); }
+    catch(e) {
+      console.error('DROPBOX ERROR: Cannot parse temp link response');
+      return { name: match.name, url: null, error: 'Cannot parse temp link response' };
     }
 
     if (tlData.link) {
-      console.log('RESOLVED IMAGE URL:', tlData.link.substring(0, 80));
-      return { name: match.name, url: tlData.link };
+      console.log('RESOLVED IMAGE URL:', tlData.link.substring(0, 80) + '...');
+      console.log('=== DROPBOX PIPELINE SUCCESS ===');
+      return { name: match.name, url: tlData.link, error: null };
     }
 
-    console.error('DROPBOX ERROR: No link in response:', JSON.stringify(tlData));
-    return { name: match.name, url: null };
+    // ── STEP 4: Fallback — try shared link ──
+    console.log('STEP 4: Temp link failed, trying shared link fallback...');
+    console.log('Temp link error:', JSON.stringify(tlData));
+
+    // Try listing existing shared links first
+    const existResp = await fetch('https://api.dropboxapi.com/2/sharing/list_shared_links', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+      body: JSON.stringify({ path: match.path_lower, direct_only: true })
+    });
+    const existText = await existResp.text();
+    console.log('LIST SHARED LINKS STATUS:', existResp.status);
+
+    if (existResp.status === 200) {
+      try {
+        const existData = JSON.parse(existText);
+        if (existData.links && existData.links.length > 0) {
+          const sharedUrl = existData.links[0].url
+            .replace('www.dropbox.com', 'dl.dropboxusercontent.com')
+            .replace('?dl=0', '').replace('dl=0', '');
+          console.log('RESOLVED via existing shared link:', sharedUrl.substring(0, 80));
+          return { name: match.name, url: sharedUrl, error: null };
+        }
+      } catch(e) {}
+    }
+
+    // Try creating a new shared link
+    const createResp = await fetch('https://api.dropboxapi.com/2/sharing/create_shared_link_with_settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+      body: JSON.stringify({
+        path: match.path_lower,
+        settings: { requested_visibility: 'public', audience: 'public', access: 'viewer' }
+      })
+    });
+    const createText = await createResp.text();
+    console.log('CREATE SHARED LINK STATUS:', createResp.status);
+
+    try {
+      const createData = JSON.parse(createText);
+      if (createData.url) {
+        const sharedUrl = createData.url
+          .replace('www.dropbox.com', 'dl.dropboxusercontent.com')
+          .replace('?dl=0', '');
+        console.log('RESOLVED via new shared link:', sharedUrl.substring(0, 80));
+        return { name: match.name, url: sharedUrl, error: null };
+      }
+      // Handle already exists
+      if (createData.error && createData.error['.tag'] === 'shared_link_already_exists') {
+        const existing = createData.error.shared_link_already_exists;
+        if (existing && existing.metadata && existing.metadata.url) {
+          const sharedUrl = existing.metadata.url
+            .replace('www.dropbox.com', 'dl.dropboxusercontent.com')
+            .replace('?dl=0', '');
+          console.log('RESOLVED via already-exists shared link');
+          return { name: match.name, url: sharedUrl, error: null };
+        }
+      }
+    } catch(e) {}
+
+    const finalError = `File found (${match.name}) but could not generate URL. Check Dropbox permissions: files.content.read required.`;
+    console.error('DROPBOX PIPELINE FAILED:', finalError);
+    return { name: match.name, url: null, error: finalError };
 
   } catch (error) {
-    console.error('DROPBOX ERROR:', error.message);
-    return { name: null, url: null };
+    console.error('DROPBOX PIPELINE EXCEPTION:', error.message);
+    return { name: null, url: null, error: `Dropbox pipeline exception: ${error.message}` };
   }
 }
 
@@ -157,43 +202,25 @@ app.post('/chat', async (req, res) => {
   try {
     const apiKey = process.env.ANTHROPIC_API_KEY;
     if (!apiKey) return res.status(400).json({ error: 'No API key configured' });
-
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01'
-      },
+      headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
       body: JSON.stringify({
-        model: 'claude-sonnet-4-5',
-        max_tokens: 1500,
+        model: 'claude-sonnet-4-5', max_tokens: 1500,
         system: req.body.system || 'You are HALO, a helpful AI assistant.',
         messages: req.body.messages || []
       })
     });
-
     const text = await response.text();
-
     let data;
-    try {
-      data = JSON.parse(text);
-    } catch (e) {
-      return res.status(500).json({ error: 'Parse error' });
-    }
-
+    try { data = JSON.parse(text); } catch(e) { return res.status(500).json({ error: 'Parse error' }); }
     if (data.error) return res.status(400).json({ error: JSON.stringify(data.error) });
-
     if (data.content && Array.isArray(data.content)) {
-      for (let i = 0; i < data.content.length; i++) {
-        if (data.content[i].type === 'text' && data.content[i].text) {
-          return res.json({ reply: data.content[i].text });
-        }
+      for (const block of data.content) {
+        if (block.type === 'text' && block.text) return res.json({ reply: block.text });
       }
     }
-
     res.status(500).json({ error: 'No text in response' });
-
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -204,34 +231,16 @@ app.post('/speak', async (req, res) => {
   try {
     const elevenKey = process.env.ELEVENLABS_API_KEY;
     if (!elevenKey) return res.status(400).json({ error: 'No ElevenLabs key configured' });
-
     const text = req.body.text || '';
-
     const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'xi-api-key': elevenKey
-      },
-      body: JSON.stringify({
-        text,
-        model_id: 'eleven_turbo_v2_5',
-        voice_settings: {
-          stability: 0.5,
-          similarity_boost: 0.75
-        }
-      })
+      headers: { 'Content-Type': 'application/json', 'xi-api-key': elevenKey },
+      body: JSON.stringify({ text, model_id: 'eleven_turbo_v2_5', voice_settings: { stability: 0.5, similarity_boost: 0.75 } })
     });
-
-    if (!response.ok) {
-      const err = await response.text();
-      return res.status(400).json({ error: err });
-    }
-
+    if (!response.ok) { const err = await response.text(); return res.status(400).json({ error: err }); }
     const audioBuffer = await response.arrayBuffer();
     res.set('Content-Type', 'audio/mpeg');
     res.send(Buffer.from(audioBuffer));
-
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -241,68 +250,90 @@ app.post('/speak', async (req, res) => {
 const recentPosts = new Map();
 
 app.post('/post-content', async (req, res) => {
-  console.log('POST COMMAND TRIGGERED');
+  console.log('=== POST CONTENT TRIGGERED ===');
+  console.log('Request body:', JSON.stringify(req.body));
 
+  // Deduplicate
   const key = (req.body.filename || req.body.description || '').toLowerCase().trim();
   const now = Date.now();
-
   if (recentPosts.has(key) && now - recentPosts.get(key) < 3000) {
     console.log('DUPLICATE IGNORED:', key);
     return res.json({ success: true, message: 'Duplicate ignored', filename: key });
   }
-
   recentPosts.set(key, now);
   setTimeout(() => recentPosts.delete(key), 5000);
 
   try {
     const webhookUrl = process.env.MAKE_WEBHOOK_URL;
-    if (!webhookUrl) return res.status(400).json({ error: 'No webhook configured' });
+    if (!webhookUrl) return res.status(400).json({ error: 'No MAKE_WEBHOOK_URL configured' });
 
     const { description, filename, platforms } = req.body;
 
-    let resolvedFilename = filename || null;
+    let resolvedFilename = filename || description || '';
     let resolvedUrl = null;
+    let dropboxError = null;
 
+    // ── Search Dropbox ──
     if (filename) {
       console.log('Searching Dropbox for:', filename);
       const result = await findDropboxFile(filename);
+      console.log('Dropbox Search Result:', JSON.stringify(result));
 
-      if (result.name) {
-        resolvedFilename = result.name;
-        resolvedUrl = result.url;
-        console.log('Found:', resolvedFilename, 'URL:', resolvedUrl);
-      } else {
-        console.log('No match found for:', filename);
-        resolvedFilename = filename;
-      }
+      resolvedFilename = result.name || filename;
+      resolvedUrl = result.url || null;
+      dropboxError = result.error || null;
+    }
+
+    console.log('Resolved Filename:', resolvedFilename);
+    console.log('Resolved Image URL:', resolvedUrl);
+
+    // ── Block posting if no image URL ──
+    if (!resolvedUrl) {
+      const reason = dropboxError || 'Could not generate image URL from Dropbox';
+      console.error('POSTING BLOCKED — no image URL:', reason);
+      return res.status(400).json({
+        success: false,
+        error: reason,
+        filename: resolvedFilename,
+        url: null
+      });
+    }
+
+    // ── Validate URL ──
+    try {
+      new URL(resolvedUrl);
+      console.log('URL VALIDATION: PASSED');
+    } catch(e) {
+      console.error('URL VALIDATION FAILED:', resolvedUrl);
+      return res.status(400).json({ success: false, error: 'Generated URL is invalid', url: resolvedUrl });
     }
 
     const payload = {
       description: description || resolvedFilename || '',
       filename: resolvedFilename || '',
-      image_url: resolvedUrl || '',
+      image_url: resolvedUrl,
       platforms: platforms || 'Instagram, TikTok, Pinterest'
     };
 
-    console.log('Sending to Make.com:', payload);
+    console.log('Post Payload:', JSON.stringify(payload));
 
-    res.json({
-      success: true,
-      message: 'Content queued',
-      filename: resolvedFilename,
-      url: resolvedUrl
-    });
+    // Respond immediately
+    res.json({ success: true, message: 'Content queued', filename: resolvedFilename, url: resolvedUrl });
 
+    // Send to Make.com in background
+    console.log('Sending to Make.com webhook...');
     fetch(webhookUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
-    })
-      .then(r => r.text())
-      .then(t => console.log('Make.com response:', t))
-      .catch(e => console.log('Make.com error:', e.message));
+    }).then(r => r.text()).then(t => {
+      console.log('Make.com response:', t);
+    }).catch(e => {
+      console.error('Make.com error:', e.message);
+    });
 
   } catch (error) {
+    console.error('POST CONTENT EXCEPTION:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
@@ -312,9 +343,7 @@ app.post('/caption', async (req, res) => {
   try {
     const apiKey = process.env.ANTHROPIC_API_KEY;
     if (!apiKey) return res.status(400).json({ error: 'No API key configured' });
-
     const { description, platforms } = req.body;
-
     const prompt = `You are the social media voice for OMKEER — a luxury faith-driven streetwear brand. Tagline: "Not a team. A belief."
 
 Generate a social media post for: ${description}
@@ -327,461 +356,18 @@ Caption: 1-3 lines, bold, faith-driven, luxury streetwear. Max 2 emojis. 25 hash
 
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01'
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-5',
-        max_tokens: 1000,
-        messages: [{ role: 'user', content: prompt }]
-      })
+      headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({ model: 'claude-sonnet-4-5', max_tokens: 1000, messages: [{ role: 'user', content: prompt }] })
     });
-
     const data = await response.json();
-
     if (data.error) return res.status(400).json({ error: data.error.message });
-
     let text = '';
-    if (data.content) {
-      for (const b of data.content) {
-        if (b.type === 'text') {
-          text = b.text;
-          break;
-        }
-      }
-    }
-
-    try {
-      res.json(JSON.parse(text.replace(/```json|```/g, '').trim()));
-    } catch (e) {
-      res.json({
-        caption: text,
-        hashtags: '',
-        full_post: text
-      });
-    }
-
+    if (data.content) for (const b of data.content) if (b.type === 'text') { text = b.text; break; }
+    try { res.json(JSON.parse(text.replace(/```json|```/g, '').trim())); }
+    catch(e) { res.json({ caption: text, hashtags: '', full_post: text }); }
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
-});
-
-// ── GOOGLE GEOCODING HELPER ──
-async function geocodeAddress(address) {
-  const apiKey = process.env.GOOGLE_MAPS_API_KEY;
-  const resolved = resolvePlaceName(address);
-
-  const url = new URL('https://maps.googleapis.com/maps/api/geocode/json');
-  url.searchParams.set('address', resolved);
-  url.searchParams.set('key', apiKey);
-
-  const response = await fetch(url);
-  const data = await response.json();
-
-  if (data.status !== 'OK' || !data.results?.[0]) {
-    throw new Error(`Geocoding failed for ${resolved}: ${data.status || 'UNKNOWN'}`);
-  }
-
-  const result = data.results[0];
-
-  return {
-    query: address,
-    resolved,
-    formatted_address: result.formatted_address,
-    location: result.geometry.location
-  };
-}
-
-// ── ROUTE INTEL — Google Routes API ──
-app.post('/route-intel', async (req, res) => {
-  try {
-    const { origin = 'Sylmar, CA', destination, alternatives = true } = req.body;
-
-    if (!process.env.GOOGLE_MAPS_API_KEY) {
-      return res.status(500).json({
-        error: 'Missing GOOGLE_MAPS_API_KEY in Render environment variables'
-      });
-    }
-
-    if (!destination) {
-      return res.status(400).json({ error: 'Destination is required' });
-    }
-
-    const resolvedOrigin = resolvePlaceName(origin);
-    const resolvedDestination = resolvePlaceName(destination);
-
-    const response = await fetch('https://routes.googleapis.com/directions/v2:computeRoutes', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Goog-Api-Key': process.env.GOOGLE_MAPS_API_KEY,
-        'X-Goog-FieldMask': [
-          'routes.duration',
-          'routes.staticDuration',
-          'routes.distanceMeters',
-          'routes.description',
-          'routes.polyline.encodedPolyline',
-          'routes.legs.startLocation',
-          'routes.legs.endLocation',
-          'routes.routeLabels'
-        ].join(',')
-      },
-      body: JSON.stringify({
-        origin: { address: resolvedOrigin },
-        destination: { address: resolvedDestination },
-        travelMode: 'DRIVE',
-        routingPreference: 'TRAFFIC_AWARE_OPTIMAL',
-        computeAlternativeRoutes: Boolean(alternatives)
-      })
-    });
-
-    const data = await response.json();
-
-    if (!response.ok) {
-      console.error('GOOGLE ROUTES ERROR:', JSON.stringify(data));
-      return res.status(response.status).json(data);
-    }
-
-    const routes = data.routes || [];
-
-    if (!routes.length) {
-      return res.status(404).json({ error: 'No route found' });
-    }
-
-    const formattedRoutes = routes.map((route, index) => {
-      const trafficSeconds = parseGoogleSeconds(route.duration);
-      const normalSeconds = parseGoogleSeconds(route.staticDuration);
-      const delaySeconds = Math.max(trafficSeconds - normalSeconds, 0);
-      const endLocation = route.legs?.[0]?.endLocation?.latLng || null;
-      const startLocation = route.legs?.[0]?.startLocation?.latLng || null;
-
-      return {
-        route_index: index,
-        label: index === 0 ? 'Recommended' : `Option ${index + 1}`,
-        description: route.description || (index === 0 ? 'Best available route' : `Alternative route ${index + 1}`),
-        eta_minutes: Math.round(trafficSeconds / 60),
-        normal_minutes: Math.round(normalSeconds / 60),
-        delay_minutes: Math.round(delaySeconds / 60),
-        distance_miles: metersToMiles(route.distanceMeters),
-        traffic_level: trafficLevelFromDelay(delaySeconds),
-        polyline: route.polyline?.encodedPolyline || null,
-        start_location: startLocation,
-        end_location: endLocation,
-        route_labels: route.routeLabels || []
-      };
-    });
-
-    const primary = formattedRoutes[0];
-
-    res.json({
-      success: true,
-      origin: resolvedOrigin,
-      destination: resolvedDestination,
-      requested_origin: origin,
-      requested_destination: destination,
-      ...primary,
-      routes: formattedRoutes
-    });
-
-  } catch (error) {
-    console.error('ROUTE INTEL ERROR:', error.message);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// ── TRANSIT INTEL — Google Directions API Transit Mode ──
-// Commands this supports on the frontend later:
-// transit to LAX, bus to Santa Monica, train to downtown, how do I get to work by bus
-app.post('/transit-intel', async (req, res) => {
-  try {
-    const {
-      origin = 'Sylmar, CA',
-      destination,
-      departure_time = 'now',
-      alternatives = true
-    } = req.body;
-
-    if (!process.env.GOOGLE_MAPS_API_KEY) {
-      return res.status(500).json({
-        error: 'Missing GOOGLE_MAPS_API_KEY in Render environment variables'
-      });
-    }
-
-    if (!destination) {
-      return res.status(400).json({ error: 'Destination is required' });
-    }
-
-    const resolvedOrigin = resolvePlaceName(origin);
-    const resolvedDestination = resolvePlaceName(destination);
-
-    const url = new URL('https://maps.googleapis.com/maps/api/directions/json');
-    url.searchParams.set('origin', resolvedOrigin);
-    url.searchParams.set('destination', resolvedDestination);
-    url.searchParams.set('mode', 'transit');
-    url.searchParams.set('alternatives', Boolean(alternatives) ? 'true' : 'false');
-    url.searchParams.set('departure_time', departure_time === 'now' ? 'now' : String(departure_time));
-    url.searchParams.set('key', process.env.GOOGLE_MAPS_API_KEY);
-
-    const response = await fetch(url);
-    const data = await response.json();
-
-    if (data.status !== 'OK') {
-      console.error('GOOGLE TRANSIT ERROR:', JSON.stringify(data));
-      return res.status(400).json({
-        success: false,
-        error: data.error_message || data.status || 'Transit route failed',
-        google_status: data.status
-      });
-    }
-
-    const routes = (data.routes || []).map((route, routeIndex) => {
-      const leg = route.legs?.[0] || {};
-      const steps = (leg.steps || []).map((step, stepIndex) => {
-        const transit = step.transit_details || null;
-        const vehicle = transit?.line?.vehicle || null;
-        const line = transit?.line || null;
-
-        return {
-          step_index: stepIndex,
-          travel_mode: step.travel_mode,
-          instruction: stripHtml(step.html_instructions),
-          duration_minutes: Math.round((step.duration?.value || 0) / 60),
-          distance_miles: metersToMiles(step.distance?.value || 0),
-          polyline: step.polyline?.points || null,
-          transit: transit ? {
-            line_name: line?.name || null,
-            line_short_name: line?.short_name || null,
-            agency: line?.agencies?.[0]?.name || null,
-            vehicle_type: vehicle?.type || null,
-            vehicle_name: vehicle?.name || null,
-            departure_stop: transit.departure_stop?.name || null,
-            arrival_stop: transit.arrival_stop?.name || null,
-            departure_time: transit.departure_time?.text || null,
-            arrival_time: transit.arrival_time?.text || null,
-            departure_time_iso: formatUnixTime(transit.departure_time?.value),
-            arrival_time_iso: formatUnixTime(transit.arrival_time?.value),
-            num_stops: transit.num_stops || null,
-            headsign: transit.headsign || null
-          } : null
-        };
-      });
-
-      const transitSteps = steps.filter(step => step.travel_mode === 'TRANSIT');
-      const walkingSteps = steps.filter(step => step.travel_mode === 'WALKING');
-
-      return {
-        route_index: routeIndex,
-        label: routeIndex === 0 ? 'Recommended Transit' : `Transit Option ${routeIndex + 1}`,
-        summary: route.summary || '',
-        total_duration_minutes: Math.round((leg.duration?.value || 0) / 60),
-        arrival_time: leg.arrival_time?.text || null,
-        departure_time: leg.departure_time?.text || null,
-        arrival_time_iso: formatUnixTime(leg.arrival_time?.value),
-        departure_time_iso: formatUnixTime(leg.departure_time?.value),
-        distance_miles: metersToMiles(leg.distance?.value || 0),
-        start_address: leg.start_address || resolvedOrigin,
-        end_address: leg.end_address || resolvedDestination,
-        start_location: leg.start_location || null,
-        end_location: leg.end_location || null,
-        polyline: route.overview_polyline?.points || null,
-        transit_lines: transitSteps.map(step => ({
-          line: step.transit?.line_short_name || step.transit?.line_name || 'Transit line',
-          vehicle: step.transit?.vehicle_name || step.transit?.vehicle_type || 'Transit',
-          agency: step.transit?.agency || null,
-          departure_stop: step.transit?.departure_stop || null,
-          arrival_stop: step.transit?.arrival_stop || null,
-          departure_time: step.transit?.departure_time || null,
-          arrival_time: step.transit?.arrival_time || null,
-          headsign: step.transit?.headsign || null,
-          num_stops: step.transit?.num_stops || null
-        })),
-        walking_minutes: walkingSteps.reduce((sum, step) => sum + step.duration_minutes, 0),
-        transit_minutes: transitSteps.reduce((sum, step) => sum + step.duration_minutes, 0),
-        steps
-      };
-    });
-
-    const primary = routes[0];
-
-    res.json({
-      success: true,
-      mode: 'TRANSIT',
-      origin: resolvedOrigin,
-      destination: resolvedDestination,
-      requested_origin: origin,
-      requested_destination: destination,
-      ...primary,
-      routes
-    });
-
-  } catch (error) {
-    console.error('TRANSIT INTEL ERROR:', error.message);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// ── PLACES NEARBY — Gas / Parking / Useful Stops ──
-app.post('/places-nearby', async (req, res) => {
-  try {
-    const { destination, location, type = 'gas', radius = 2500, max_results = 8 } = req.body;
-
-    if (!process.env.GOOGLE_MAPS_API_KEY) {
-      return res.status(500).json({
-        error: 'Missing GOOGLE_MAPS_API_KEY in Render environment variables'
-      });
-    }
-
-    let center = location;
-
-    if (!center && destination) {
-      const geo = await geocodeAddress(destination);
-      center = {
-        latitude: geo.location.lat,
-        longitude: geo.location.lng
-      };
-    }
-
-    if (!center?.latitude || !center?.longitude) {
-      return res.status(400).json({
-        error: 'Provide destination or location {latitude, longitude}'
-      });
-    }
-
-    const includedType =
-      String(type).toLowerCase().includes('park') ? 'parking' :
-      String(type).toLowerCase().includes('gas') ? 'gas_station' :
-      'gas_station';
-
-    const response = await fetch('https://places.googleapis.com/v1/places:searchNearby', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Goog-Api-Key': process.env.GOOGLE_MAPS_API_KEY,
-        'X-Goog-FieldMask': [
-          'places.id',
-          'places.displayName',
-          'places.formattedAddress',
-          'places.location',
-          'places.rating',
-          'places.googleMapsUri',
-          'places.types'
-        ].join(',')
-      },
-      body: JSON.stringify({
-        includedTypes: [includedType],
-        maxResultCount: Math.min(Number(max_results) || 8, 20),
-        locationRestriction: {
-          circle: {
-            center,
-            radius: Math.min(Number(radius) || 2500, 50000)
-          }
-        }
-      })
-    });
-
-    const data = await response.json();
-
-    if (!response.ok) {
-      console.error('GOOGLE PLACES ERROR:', JSON.stringify(data));
-      return res.status(response.status).json(data);
-    }
-
-    const places = (data.places || []).map(place => ({
-      id: place.id,
-      name: place.displayName?.text || 'Unknown place',
-      address: place.formattedAddress || '',
-      rating: place.rating || null,
-      location: place.location || null,
-      google_maps_url: place.googleMapsUri || null,
-      types: place.types || []
-    }));
-
-    res.json({
-      success: true,
-      type: includedType,
-      center,
-      count: places.length,
-      places
-    });
-
-  } catch (error) {
-    console.error('PLACES NEARBY ERROR:', error.message);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// ── ROUTE PLUS — Route + Gas + Parking in one call ──
-app.post('/route-plus', async (req, res) => {
-  try {
-    const { origin = 'Sylmar, CA', destination } = req.body;
-
-    if (!destination) {
-      return res.status(400).json({ error: 'Destination is required' });
-    }
-
-    const routeResp = await fetch(`${req.protocol}://${req.get('host')}/route-intel`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ origin, destination, alternatives: true })
-    });
-
-    const routeData = await routeResp.json();
-
-    if (!routeResp.ok || !routeData.success) {
-      return res.status(routeResp.status).json(routeData);
-    }
-
-    const end = routeData.end_location;
-    const center = end ? {
-      latitude: end.latitude,
-      longitude: end.longitude
-    } : null;
-
-    let gas = [];
-    let parking = [];
-
-    if (center) {
-      const [gasResp, parkingResp] = await Promise.all([
-        fetch(`${req.protocol}://${req.get('host')}/places-nearby`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ location: center, type: 'gas', radius: 3500, max_results: 5 })
-        }),
-        fetch(`${req.protocol}://${req.get('host')}/places-nearby`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ location: center, type: 'parking', radius: 2500, max_results: 5 })
-        })
-      ]);
-
-      const gasData = await gasResp.json();
-      const parkingData = await parkingResp.json();
-
-      gas = gasData.places || [];
-      parking = parkingData.places || [];
-    }
-
-    res.json({
-      success: true,
-      route: routeData,
-      gas,
-      parking
-    });
-
-  } catch (error) {
-    console.error('ROUTE PLUS ERROR:', error.message);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// ── SAVED PLACES ──
-app.get('/saved-places', (req, res) => {
-  res.json({
-    success: true,
-    saved_places: SAVED_PLACES
-  });
 });
 
 app.get('/', (req, res) => res.send('HALO Server Online'));
