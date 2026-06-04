@@ -478,8 +478,17 @@ app.post('/route-plus', async (req, res) => {
     // Use Google Maps Directions API if available, otherwise use OpenRouteService (free)
     const GOOGLE_KEY = process.env.GOOGLE_MAPS_KEY;
 
-    // Build geocode URLs
-    const originStr = origin === 'home' ? 'Los Angeles, CA' : origin;
+    // Build origin string — accept GPS coords or named location
+    let originStr;
+    if(!origin || origin === 'home'){
+      originStr = 'Los Angeles, CA';
+    } else if(/^-?\d+\.\d+,-?\d+\.\d+$/.test(origin)){
+      // Raw GPS coordinates passed from browser
+      originStr = origin;
+      console.log('Using GPS coordinates as origin:', originStr);
+    } else {
+      originStr = origin;
+    }
 
     if (GOOGLE_KEY) {
       // Google Maps route
@@ -536,9 +545,15 @@ app.post('/route-plus', async (req, res) => {
     const destLng = parseFloat(geoData[0].lon);
     const destName = geoData[0].display_name.split(',').slice(0, 2).join(',');
 
-    // Origin coords (LA default)
-    const originLat = 34.0522;
-    const originLng = -118.2437;
+    // Origin coords — use GPS if provided, otherwise LA default
+    let originLat = 34.0522;
+    let originLng = -118.2437;
+    if(originStr && /^-?\d+\.\d+,-?\d+\.\d+$/.test(originStr)){
+      const parts = originStr.split(',');
+      originLat = parseFloat(parts[0]);
+      originLng = parseFloat(parts[1]);
+      console.log('Using GPS origin:', originLat, originLng);
+    }
 
     // Estimate distance and ETA
     const R = 3959; // miles
