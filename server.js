@@ -471,7 +471,8 @@ Caption: 1-3 lines, bold, faith-driven, luxury streetwear. Max 2 emojis. 25 hash
 app.post('/route-plus', async (req, res) => {
   try {
     const { origin, destination } = req.body;
-    console.log('ROUTE REQUEST:', origin, '->', destination);
+    console.log('ROUTE REQUEST — origin:', JSON.stringify(origin), '| destination:', JSON.stringify(destination));
+    console.log('Origin type:', typeof origin, '| Is GPS?', /^-?\d+\.\d+,-?\d+\.\d+$/.test(origin||''));
 
     if (!destination) return res.status(400).json({ success: false, error: 'No destination provided' });
 
