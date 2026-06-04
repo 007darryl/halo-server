@@ -18,7 +18,10 @@ const SAVED_PLACES = {
   beach: 'Santa Monica Pier',
   santamonica: 'Santa Monica Pier',
   dodgers: 'Dodger Stadium',
-  dodgerstadium: 'Dodger Stadium'
+  dodgerstadium: 'Dodger Stadium',
+  downtown: 'Downtown Los Angeles, CA',
+  dtla: 'Downtown Los Angeles, CA',
+  hollywood: 'Hollywood, Los Angeles, CA'
 };
 
 function resolvePlaceName(value) {
@@ -37,6 +40,19 @@ function trafficLevelFromDelay(delaySeconds) {
   if (delaySeconds >= 600) return 'Moderate';
   if (delaySeconds >= 180) return 'Light';
   return 'Clear';
+}
+
+function metersToMiles(meters) {
+  return Number((Number(meters || 0) / 1609.34).toFixed(1));
+}
+
+function stripHtml(value) {
+  return String(value || '').replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+}
+
+function formatUnixTime(seconds) {
+  if (!seconds) return null;
+  return new Date(Number(seconds) * 1000).toISOString();
 }
 
 // ── DROPBOX: Search for file and get direct image URL ──
@@ -448,7 +464,7 @@ app.post('/route-intel', async (req, res) => {
         eta_minutes: Math.round(trafficSeconds / 60),
         normal_minutes: Math.round(normalSeconds / 60),
         delay_minutes: Math.round(delaySeconds / 60),
-        distance_miles: Number((route.distanceMeters / 1609.34).toFixed(1)),
+        distance_miles: metersToMiles(route.distanceMeters),
         traffic_level: trafficLevelFromDelay(delaySeconds),
         polyline: route.polyline?.encodedPolyline || null,
         start_location: startLocation,
@@ -471,6 +487,137 @@ app.post('/route-intel', async (req, res) => {
 
   } catch (error) {
     console.error('ROUTE INTEL ERROR:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ── TRANSIT INTEL — Google Directions API Transit Mode ──
+// Commands this supports on the frontend later:
+// transit to LAX, bus to Santa Monica, train to downtown, how do I get to work by bus
+app.post('/transit-intel', async (req, res) => {
+  try {
+    const {
+      origin = 'Sylmar, CA',
+      destination,
+      departure_time = 'now',
+      alternatives = true
+    } = req.body;
+
+    if (!process.env.GOOGLE_MAPS_API_KEY) {
+      return res.status(500).json({
+        error: 'Missing GOOGLE_MAPS_API_KEY in Render environment variables'
+      });
+    }
+
+    if (!destination) {
+      return res.status(400).json({ error: 'Destination is required' });
+    }
+
+    const resolvedOrigin = resolvePlaceName(origin);
+    const resolvedDestination = resolvePlaceName(destination);
+
+    const url = new URL('https://maps.googleapis.com/maps/api/directions/json');
+    url.searchParams.set('origin', resolvedOrigin);
+    url.searchParams.set('destination', resolvedDestination);
+    url.searchParams.set('mode', 'transit');
+    url.searchParams.set('alternatives', Boolean(alternatives) ? 'true' : 'false');
+    url.searchParams.set('departure_time', departure_time === 'now' ? 'now' : String(departure_time));
+    url.searchParams.set('key', process.env.GOOGLE_MAPS_API_KEY);
+
+    const response = await fetch(url);
+    const data = await response.json();
+
+    if (data.status !== 'OK') {
+      console.error('GOOGLE TRANSIT ERROR:', JSON.stringify(data));
+      return res.status(400).json({
+        success: false,
+        error: data.error_message || data.status || 'Transit route failed',
+        google_status: data.status
+      });
+    }
+
+    const routes = (data.routes || []).map((route, routeIndex) => {
+      const leg = route.legs?.[0] || {};
+      const steps = (leg.steps || []).map((step, stepIndex) => {
+        const transit = step.transit_details || null;
+        const vehicle = transit?.line?.vehicle || null;
+        const line = transit?.line || null;
+
+        return {
+          step_index: stepIndex,
+          travel_mode: step.travel_mode,
+          instruction: stripHtml(step.html_instructions),
+          duration_minutes: Math.round((step.duration?.value || 0) / 60),
+          distance_miles: metersToMiles(step.distance?.value || 0),
+          polyline: step.polyline?.points || null,
+          transit: transit ? {
+            line_name: line?.name || null,
+            line_short_name: line?.short_name || null,
+            agency: line?.agencies?.[0]?.name || null,
+            vehicle_type: vehicle?.type || null,
+            vehicle_name: vehicle?.name || null,
+            departure_stop: transit.departure_stop?.name || null,
+            arrival_stop: transit.arrival_stop?.name || null,
+            departure_time: transit.departure_time?.text || null,
+            arrival_time: transit.arrival_time?.text || null,
+            departure_time_iso: formatUnixTime(transit.departure_time?.value),
+            arrival_time_iso: formatUnixTime(transit.arrival_time?.value),
+            num_stops: transit.num_stops || null,
+            headsign: transit.headsign || null
+          } : null
+        };
+      });
+
+      const transitSteps = steps.filter(step => step.travel_mode === 'TRANSIT');
+      const walkingSteps = steps.filter(step => step.travel_mode === 'WALKING');
+
+      return {
+        route_index: routeIndex,
+        label: routeIndex === 0 ? 'Recommended Transit' : `Transit Option ${routeIndex + 1}`,
+        summary: route.summary || '',
+        total_duration_minutes: Math.round((leg.duration?.value || 0) / 60),
+        arrival_time: leg.arrival_time?.text || null,
+        departure_time: leg.departure_time?.text || null,
+        arrival_time_iso: formatUnixTime(leg.arrival_time?.value),
+        departure_time_iso: formatUnixTime(leg.departure_time?.value),
+        distance_miles: metersToMiles(leg.distance?.value || 0),
+        start_address: leg.start_address || resolvedOrigin,
+        end_address: leg.end_address || resolvedDestination,
+        start_location: leg.start_location || null,
+        end_location: leg.end_location || null,
+        polyline: route.overview_polyline?.points || null,
+        transit_lines: transitSteps.map(step => ({
+          line: step.transit?.line_short_name || step.transit?.line_name || 'Transit line',
+          vehicle: step.transit?.vehicle_name || step.transit?.vehicle_type || 'Transit',
+          agency: step.transit?.agency || null,
+          departure_stop: step.transit?.departure_stop || null,
+          arrival_stop: step.transit?.arrival_stop || null,
+          departure_time: step.transit?.departure_time || null,
+          arrival_time: step.transit?.arrival_time || null,
+          headsign: step.transit?.headsign || null,
+          num_stops: step.transit?.num_stops || null
+        })),
+        walking_minutes: walkingSteps.reduce((sum, step) => sum + step.duration_minutes, 0),
+        transit_minutes: transitSteps.reduce((sum, step) => sum + step.duration_minutes, 0),
+        steps
+      };
+    });
+
+    const primary = routes[0];
+
+    res.json({
+      success: true,
+      mode: 'TRANSIT',
+      origin: resolvedOrigin,
+      destination: resolvedDestination,
+      requested_origin: origin,
+      requested_destination: destination,
+      ...primary,
+      routes
+    });
+
+  } catch (error) {
+    console.error('TRANSIT INTEL ERROR:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
