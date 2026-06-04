@@ -467,6 +467,128 @@ Caption: 1-3 lines, bold, faith-driven, luxury streetwear. Max 2 emojis. 25 hash
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
+// ── ROUTE PLUS ──
+app.post('/route-plus', async (req, res) => {
+  try {
+    const { origin, destination } = req.body;
+    console.log('ROUTE REQUEST:', origin, '->', destination);
+
+    if (!destination) return res.status(400).json({ success: false, error: 'No destination provided' });
+
+    // Use Google Maps Directions API if available, otherwise use OpenRouteService (free)
+    const GOOGLE_KEY = process.env.GOOGLE_MAPS_KEY;
+
+    // Build geocode URLs
+    const originStr = origin === 'home' ? 'Los Angeles, CA' : origin;
+
+    if (GOOGLE_KEY) {
+      // Google Maps route
+      const url = `https://maps.googleapis.com/maps/api/directions/json?origin=${encodeURIComponent(originStr)}&destination=${encodeURIComponent(destination)}&key=${GOOGLE_KEY}&departure_time=now&traffic_model=best_guess`;
+      const resp = await fetch(url);
+      const data = await resp.json();
+
+      if (data.status === 'OK' && data.routes.length > 0) {
+        const route = data.routes[0];
+        const leg = route.legs[0];
+        const eta = Math.round(leg.duration_in_traffic?.value / 60 || leg.duration.value / 60);
+        const normal = Math.round(leg.duration.value / 60);
+        const delay = Math.max(0, eta - normal);
+        const distance = leg.distance.text;
+        const trafficLevel = delay > 15 ? 'HEAVY' : delay > 5 ? 'MODERATE' : 'CLEAR';
+
+        return res.json({
+          success: true,
+          route: {
+            destination,
+            origin: originStr,
+            routes: [{
+              label: 'Recommended',
+              description: `${distance} via ${route.summary}`,
+              eta_minutes: eta,
+              delay_minutes: delay,
+              traffic_level: trafficLevel,
+              polyline: route.overview_polyline.points,
+              start_location: { lat: leg.start_location.lat, lng: leg.start_location.lng },
+              end_location: { lat: leg.end_location.lat, lng: leg.end_location.lng },
+            }],
+            traffic_level: trafficLevel,
+            start_location: { lat: leg.start_location.lat, lng: leg.start_location.lng },
+            end_location: { lat: leg.end_location.lat, lng: leg.end_location.lng },
+          },
+          gas: [],
+          parking: []
+        });
+      }
+      console.log('Google Maps error:', data.status);
+    }
+
+    // Fallback: geocode with Nominatim and return straight line route
+    console.log('Using Nominatim fallback geocoding');
+    const geocodeUrl = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(destination)}&format=json&limit=1`;
+    const geoResp = await fetch(geocodeUrl, { headers: { 'User-Agent': 'HALO-AI/1.0' } });
+    const geoData = await geoResp.json();
+
+    if (!geoData || geoData.length === 0) {
+      return res.status(404).json({ success: false, error: `Could not find location: ${destination}` });
+    }
+
+    const destLat = parseFloat(geoData[0].lat);
+    const destLng = parseFloat(geoData[0].lon);
+    const destName = geoData[0].display_name.split(',').slice(0, 2).join(',');
+
+    // Origin coords (LA default)
+    const originLat = 34.0522;
+    const originLng = -118.2437;
+
+    // Estimate distance and ETA
+    const R = 3959; // miles
+    const dLat = (destLat - originLat) * Math.PI / 180;
+    const dLon = (destLng - originLng) * Math.PI / 180;
+    const a = Math.sin(dLat/2)**2 + Math.cos(originLat*Math.PI/180) * Math.cos(destLat*Math.PI/180) * Math.sin(dLon/2)**2;
+    const distMiles = R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+    const etaMins = Math.round(distMiles / 0.5); // ~30mph average
+
+    // Create simple polyline (straight line encoded)
+    // Simple encoding of two points
+    function encodeCoord(c) {
+      c = Math.round(c * 1e5);
+      c = c < 0 ? ~(c << 1) : (c << 1);
+      let s = '';
+      while (c >= 0x20) { s += String.fromCharCode((0x20 | (c & 0x1f)) + 63); c >>= 5; }
+      s += String.fromCharCode(c + 63);
+      return s;
+    }
+    const polyline = encodeCoord(originLat) + encodeCoord(originLng) + encodeCoord(destLat - originLat) + encodeCoord(destLng - originLng);
+
+    res.json({
+      success: true,
+      route: {
+        destination: destName,
+        origin: 'Los Angeles, CA',
+        routes: [{
+          label: 'Direct Route',
+          description: `${distMiles.toFixed(1)} miles`,
+          eta_minutes: etaMins,
+          delay_minutes: 0,
+          traffic_level: 'CLEAR',
+          polyline,
+          start_location: { lat: originLat, lng: originLng },
+          end_location: { lat: destLat, lng: destLng },
+        }],
+        traffic_level: 'CLEAR',
+        start_location: { lat: originLat, lng: originLng },
+        end_location: { lat: destLat, lng: destLng },
+      },
+      gas: [],
+      parking: []
+    });
+
+  } catch (error) {
+    console.error('ROUTE ERROR:', error.message);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 app.get('/', (req, res) => res.send('HALO Server Online'));
 
 const PORT = process.env.PORT || 3000;
