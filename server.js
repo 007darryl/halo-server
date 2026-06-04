@@ -282,6 +282,60 @@ app.post('/speak', async (req, res) => {
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
+// ── TIME PARSER ──
+function parseScheduledTime(text) {
+  if (!text) return null;
+  const now = new Date();
+  const la = new Date(now.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
+
+  // Match patterns like "at 8pm", "at 8:30pm", "at 20:00", "tomorrow at 6pm", "friday at noon"
+  const timeMatch = text.match(/(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i);
+  const tomorrowMatch = text.match(/tomorrow/i);
+  const dayMatch = text.match(/(monday|tuesday|wednesday|thursday|friday|saturday|sunday)/i);
+  const noonMatch = text.match(/noon/i);
+  const midnightMatch = text.match(/midnight/i);
+
+  if (!timeMatch && !noonMatch && !midnightMatch) return null;
+
+  let hours = noonMatch ? 12 : midnightMatch ? 0 : parseInt(timeMatch[1]);
+  let minutes = timeMatch && timeMatch[2] ? parseInt(timeMatch[2]) : 0;
+  const meridiem = timeMatch && timeMatch[3] ? timeMatch[3].toLowerCase() : null;
+
+  // Convert to 24hr
+  if (meridiem === 'pm' && hours !== 12) hours += 12;
+  if (meridiem === 'am' && hours === 12) hours = 0;
+  // If no am/pm and hour < 8, assume pm (nobody posts at 3am)
+  if (!meridiem && hours > 0 && hours < 8) hours += 12;
+
+  // Build target date in LA timezone
+  let target = new Date(la);
+  target.setHours(hours, minutes, 0, 0);
+
+  // Handle tomorrow
+  if (tomorrowMatch) {
+    target.setDate(target.getDate() + 1);
+  }
+
+  // Handle day of week
+  if (dayMatch) {
+    const days = ['sunday','monday','tuesday','wednesday','thursday','friday','saturday'];
+    const targetDay = days.indexOf(dayMatch[1].toLowerCase());
+    const currentDay = la.getDay();
+    let daysAhead = targetDay - currentDay;
+    if (daysAhead <= 0) daysAhead += 7;
+    target.setDate(target.getDate() + daysAhead);
+  }
+
+  // If time has already passed today, schedule for tomorrow
+  if (!tomorrowMatch && !dayMatch && target <= la) {
+    target.setDate(target.getDate() + 1);
+  }
+
+  // Return ISO string
+  console.log('Scheduled time parsed:', target.toISOString(), 'LA time:', target.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
+  return target.toISOString();
+}
+
 // ── POST CONTENT ──
 const recentPosts = new Map();
 
@@ -301,7 +355,7 @@ app.post('/post-content', async (req, res) => {
     const webhookUrl = process.env.MAKE_WEBHOOK_URL;
     if (!webhookUrl) return res.status(400).json({ error: 'No MAKE_WEBHOOK_URL configured' });
 
-    const { description, filename, platforms } = req.body;
+    const { description, filename, platforms, scheduled_at, command_text } = req.body;
     let resolvedFilename = filename || description || '';
     let resolvedUrl = null;
     let dropboxError = null;
@@ -323,16 +377,30 @@ app.post('/post-content', async (req, res) => {
       return res.status(400).json({ success: false, error: reason, filename: resolvedFilename });
     }
 
+    // Parse scheduled time from command text if provided
+    let scheduledAt = scheduled_at || null;
+    if (!scheduledAt && command_text) {
+      scheduledAt = parseScheduledTime(command_text);
+    }
+
     const payload = {
       description: description || resolvedFilename || '',
       filename: resolvedFilename || '',
       image_url: resolvedUrl,
-      platforms: platforms || 'Instagram, TikTok, Pinterest'
+      platforms: platforms || 'Instagram, TikTok, Pinterest',
+      scheduled_at: scheduledAt || null
     };
+
+    if (scheduledAt) {
+      const laTime = new Date(scheduledAt).toLocaleString('en-US', { timeZone: 'America/Los_Angeles', dateStyle: 'medium', timeStyle: 'short' });
+      console.log('POST SCHEDULED FOR:', laTime);
+    } else {
+      console.log('POST IMMEDIATE');
+    }
 
     console.log('Post Payload:', JSON.stringify(payload));
 
-    res.json({ success: true, message: 'Content queued', filename: resolvedFilename, url: resolvedUrl });
+    res.json({ success: true, message: scheduledAt ? `Scheduled for ${new Date(scheduledAt).toLocaleString('en-US',{timeZone:'America/Los_Angeles',dateStyle:'medium',timeStyle:'short'})}` : 'Content queued', filename: resolvedFilename, url: resolvedUrl, scheduled_at: scheduledAt });
 
     fetch(webhookUrl, {
       method: 'POST',
