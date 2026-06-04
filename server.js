@@ -388,30 +388,45 @@ app.post('/post-content', async (req, res) => {
       filename: resolvedFilename || '',
       image_url: resolvedUrl,
       platforms: platforms || 'Instagram, TikTok, Pinterest',
-      scheduled_at: scheduledAt || null
+      scheduled_at: scheduledAt  // always a valid ISO string — never null
     };
 
-    // If no scheduled time, use now so Buffer always gets a valid datetime
+    // Always set a valid datetime
     if (!scheduledAt) {
       scheduledAt = new Date().toISOString();
-      console.log('POST IMMEDIATE — using current time:', scheduledAt);
+      console.log('POST IMMEDIATE — scheduled_at:', scheduledAt);
     } else {
       const laTime = new Date(scheduledAt).toLocaleString('en-US', { timeZone: 'America/Los_Angeles', dateStyle: 'medium', timeStyle: 'short' });
-      console.log('POST SCHEDULED FOR:', laTime);
+      console.log('POST SCHEDULED FOR:', laTime, '| ISO:', scheduledAt);
     }
 
     console.log('Post Payload:', JSON.stringify(payload));
 
     res.json({ success: true, message: scheduledAt ? `Scheduled for ${new Date(scheduledAt).toLocaleString('en-US',{timeZone:'America/Los_Angeles',dateStyle:'medium',timeStyle:'short'})}` : 'Content queued', filename: resolvedFilename, url: resolvedUrl, scheduled_at: scheduledAt });
 
+    // ── SEND TO MAKE.COM with full debugging ──
+    console.log('=== SENDING TO MAKE.COM ===');
+    console.log('Webhook URL:', webhookUrl.substring(0, 50) + '...');
+    console.log('Payload keys:', Object.keys(payload));
+    console.log('image_url present:', !!payload.image_url);
+    console.log('scheduled_at value:', payload.scheduled_at);
+
     fetch(webhookUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
-    }).then(r => r.text()).then(t => {
-      console.log('Make.com response:', t);
+    }).then(async r => {
+      const status = r.status;
+      const text = await r.text();
+      console.log('=== MAKE.COM RESPONSE ===');
+      console.log('Status:', status);
+      console.log('Response:', text);
+      if (status !== 200) {
+        console.error('Make.com returned non-200 status:', status, text);
+      }
     }).catch(e => {
-      console.error('Make.com error:', e.message);
+      console.error('=== MAKE.COM FETCH ERROR ===');
+      console.error('Error:', e.message);
     });
 
   } catch (error) {
