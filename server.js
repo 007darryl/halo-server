@@ -391,11 +391,13 @@ app.post('/post-content', async (req, res) => {
       scheduled_at: scheduledAt || null
     };
 
-    if (scheduledAt) {
+    // If no scheduled time, use now so Buffer always gets a valid datetime
+    if (!scheduledAt) {
+      scheduledAt = new Date().toISOString();
+      console.log('POST IMMEDIATE — using current time:', scheduledAt);
+    } else {
       const laTime = new Date(scheduledAt).toLocaleString('en-US', { timeZone: 'America/Los_Angeles', dateStyle: 'medium', timeStyle: 'short' });
       console.log('POST SCHEDULED FOR:', laTime);
-    } else {
-      console.log('POST IMMEDIATE');
     }
 
     console.log('Post Payload:', JSON.stringify(payload));
