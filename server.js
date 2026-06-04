@@ -377,32 +377,39 @@ app.post('/post-content', async (req, res) => {
       return res.status(400).json({ success: false, error: reason, filename: resolvedFilename });
     }
 
-    // Parse scheduled time from command text if provided
-    let scheduledAt = scheduled_at || null;
-    if (!scheduledAt && command_text) {
-      scheduledAt = parseScheduledTime(command_text);
+    // Parse scheduled time from command
+    // If command contains "now" or no time — leave scheduled_at empty
+    // If command contains "at [time]" — parse and include scheduled_at
+    let scheduledAt = null;
+    const cmdText = (command_text || '').toLowerCase();
+    const hasNow = /\bnow\b/.test(cmdText);
+    const hasTime = /\bat\s+\d/.test(cmdText) || /\bat\s+(noon|midnight)/.test(cmdText);
+
+    if (!hasNow && hasTime) {
+      scheduledAt = parseScheduledTime(cmdText);
+      if (scheduledAt) {
+        const laTime = new Date(scheduledAt).toLocaleString('en-US', { timeZone: 'America/Los_Angeles', dateStyle: 'medium', timeStyle: 'short' });
+        console.log('POST SCHEDULED FOR:', laTime, '| ISO:', scheduledAt);
+      }
+    } else {
+      console.log('POST IMMEDIATE — no scheduled_at sent');
     }
 
     const payload = {
       description: description || resolvedFilename || '',
       filename: resolvedFilename || '',
       image_url: resolvedUrl,
-      platforms: platforms || 'Instagram, TikTok, Pinterest',
-      scheduled_at: scheduledAt  // always a valid ISO string — never null
+      platforms: platforms || 'Instagram, TikTok, Pinterest'
     };
 
-    // Always set a valid datetime
-    if (!scheduledAt) {
-      scheduledAt = new Date().toISOString();
-      console.log('POST IMMEDIATE — scheduled_at:', scheduledAt);
-    } else {
-      const laTime = new Date(scheduledAt).toLocaleString('en-US', { timeZone: 'America/Los_Angeles', dateStyle: 'medium', timeStyle: 'short' });
-      console.log('POST SCHEDULED FOR:', laTime, '| ISO:', scheduledAt);
+    // Only add scheduled_at if a time was specified
+    if (scheduledAt) {
+      payload.scheduled_at = scheduledAt;
     }
 
     console.log('Post Payload:', JSON.stringify(payload));
 
-    res.json({ success: true, message: scheduledAt ? `Scheduled for ${new Date(scheduledAt).toLocaleString('en-US',{timeZone:'America/Los_Angeles',dateStyle:'medium',timeStyle:'short'})}` : 'Content queued', filename: resolvedFilename, url: resolvedUrl, scheduled_at: scheduledAt });
+    res.json({ success: true, message: scheduledAt ? `Scheduled for ${new Date(scheduledAt).toLocaleString('en-US',{timeZone:'America/Los_Angeles',dateStyle:'medium',timeStyle:'short'})}` : 'Content queued — posting now', filename: resolvedFilename, url: resolvedUrl, scheduled_at: scheduledAt || null });
 
     // ── SEND TO MAKE.COM with full debugging ──
     console.log('=== SENDING TO MAKE.COM ===');
