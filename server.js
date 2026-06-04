@@ -468,135 +468,282 @@ Caption: 1-3 lines, bold, faith-driven, luxury streetwear. Max 2 emojis. 25 hash
 });
 
 // ── ROUTE PLUS ──
+// V14 DIAGNOSTIC FIX:
+// - Accepts GPS as "lat,lng" string OR {lat,lng}/{latitude,longitude} object.
+// - Uses browser GPS when HALO sends it; no more "home" guessing unless GPS is unavailable.
+// - Adds gas + parking using Google Places when GOOGLE_MAPS_KEY exists.
+// - Adds free OpenStreetMap/Overpass gas + parking fallback when Google Places is unavailable.
+// - Keeps the same response shape HALO already expects.
+function isValidCoord(lat, lng) {
+  return Number.isFinite(lat) && Number.isFinite(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180;
+}
+
+function parseCoordInput(value) {
+  if (!value) return null;
+
+  if (typeof value === 'object') {
+    const lat = Number(value.lat ?? value.latitude);
+    const lng = Number(value.lng ?? value.lon ?? value.longitude);
+    return isValidCoord(lat, lng) ? { lat, lng } : null;
+  }
+
+  const s = String(value).trim();
+  const m = s.match(/^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$/);
+  if (!m) return null;
+
+  const lat = Number(m[1]);
+  const lng = Number(m[2]);
+  return isValidCoord(lat, lng) ? { lat, lng } : null;
+}
+
+function haversineMiles(a, b) {
+  const R = 3959;
+  const dLat = (b.lat - a.lat) * Math.PI / 180;
+  const dLng = (b.lng - a.lng) * Math.PI / 180;
+  const s1 = Math.sin(dLat / 2) ** 2;
+  const s2 = Math.cos(a.lat * Math.PI / 180) * Math.cos(b.lat * Math.PI / 180) * Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(s1 + s2), Math.sqrt(1 - s1 - s2));
+}
+
+function encodePolyline(points) {
+  let lastLat = 0;
+  let lastLng = 0;
+  let result = '';
+
+  function encodeValue(value) {
+    let v = value < 0 ? ~(value << 1) : (value << 1);
+    let out = '';
+    while (v >= 0x20) {
+      out += String.fromCharCode((0x20 | (v & 0x1f)) + 63);
+      v >>= 5;
+    }
+    return out + String.fromCharCode(v + 63);
+  }
+
+  for (const p of points) {
+    const lat = Math.round(p.lat * 1e5);
+    const lng = Math.round(p.lng * 1e5);
+    result += encodeValue(lat - lastLat);
+    result += encodeValue(lng - lastLng);
+    lastLat = lat;
+    lastLng = lng;
+  }
+  return result;
+}
+
+async function geocodeNominatim(query) {
+  const coord = parseCoordInput(query);
+  if (coord) return { ...coord, name: `${coord.lat},${coord.lng}` };
+
+  const cleaned = String(query || '')
+    .replace(/\bfrom\s+(my\s+location|current\s+location|me|here)\b/ig, '')
+    .trim();
+
+  const geocodeUrl = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(cleaned)}&format=json&limit=1`;
+  const geoResp = await fetch(geocodeUrl, { headers: { 'User-Agent': 'HALO-AI/1.0 (navigation diagnostics)' } });
+  const geoData = await geoResp.json();
+
+  if (!geoData || geoData.length === 0) return null;
+
+  return {
+    lat: Number(geoData[0].lat),
+    lng: Number(geoData[0].lon),
+    name: (geoData[0].display_name || cleaned).split(',').slice(0, 2).join(',')
+  };
+}
+
+async function googleNearby(type, center, key, limit = 3) {
+  if (!key || !center) return [];
+
+  const params = new URLSearchParams({
+    location: `${center.lat},${center.lng}`,
+    radius: '2500',
+    type,
+    key
+  });
+
+  const url = `https://maps.googleapis.com/maps/api/place/nearbysearch/json?${params.toString()}`;
+  const resp = await fetch(url);
+  const data = await resp.json();
+
+  if (data.status !== 'OK' && data.status !== 'ZERO_RESULTS') {
+    console.log(`Google Places ${type} status:`, data.status, data.error_message || '');
+  }
+
+  return (data.results || []).slice(0, limit).map(p => ({
+    name: p.name,
+    address: p.vicinity || '',
+    rating: p.rating || null,
+    location: {
+      lat: p.geometry?.location?.lat,
+      lng: p.geometry?.location?.lng
+    },
+    lat: p.geometry?.location?.lat,
+    lng: p.geometry?.location?.lng
+  })).filter(p => isValidCoord(p.location.lat, p.location.lng));
+}
+
+async function overpassNearby(kind, center, limit = 3) {
+  if (!center) return [];
+
+  const aroundMeters = 2500;
+  const query = kind === 'gas'
+    ? `[out:json][timeout:8];node["amenity"="fuel"](around:${aroundMeters},${center.lat},${center.lng});out center ${limit};`
+    : `[out:json][timeout:8];(node["amenity"="parking"](around:${aroundMeters},${center.lat},${center.lng});way["amenity"="parking"](around:${aroundMeters},${center.lat},${center.lng});relation["amenity"="parking"](around:${aroundMeters},${center.lat},${center.lng}););out center ${limit};`;
+
+  try {
+    const resp = await fetch('https://overpass-api.de/api/interpreter', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+        'User-Agent': 'HALO-AI/1.0 (navigation diagnostics)'
+      },
+      body: new URLSearchParams({ data: query })
+    });
+    const data = await resp.json();
+
+    return (data.elements || []).slice(0, limit).map((e, i) => {
+      const lat = Number(e.lat ?? e.center?.lat);
+      const lng = Number(e.lon ?? e.center?.lon);
+      const tags = e.tags || {};
+      return {
+        name: tags.name || (kind === 'gas' ? `Gas station ${i + 1}` : `Parking ${i + 1}`),
+        address: [tags['addr:housenumber'], tags['addr:street']].filter(Boolean).join(' '),
+        rating: null,
+        location: { lat, lng },
+        lat,
+        lng
+      };
+    }).filter(p => isValidCoord(p.location.lat, p.location.lng));
+  } catch (e) {
+    console.log(`Overpass ${kind} failed:`, e.message);
+    return [];
+  }
+}
+
 app.post('/route-plus', async (req, res) => {
   try {
     const { origin, destination } = req.body;
+
+    const originCoord = parseCoordInput(origin);
+    const destinationCoord = parseCoordInput(destination);
+
     console.log('ROUTE REQUEST — origin:', JSON.stringify(origin), '| destination:', JSON.stringify(destination));
-    console.log('Origin type:', typeof origin, '| Is GPS?', /^-?\d+\.\d+,-?\d+\.\d+$/.test(origin||''));
+    console.log('Origin type:', typeof origin, '| Is GPS?', !!originCoord);
 
-    if (!destination) return res.status(400).json({ success: false, error: 'No destination provided' });
-
-    // Use Google Maps Directions API if available, otherwise use OpenRouteService (free)
-    const GOOGLE_KEY = process.env.GOOGLE_MAPS_KEY;
-
-    // Build origin string — accept GPS coords or named location
-    let originStr;
-    if(!origin || origin === 'home'){
-      originStr = 'Los Angeles, CA';
-    } else if(/^-?\d+\.\d+,-?\d+\.\d+$/.test(origin)){
-      // Raw GPS coordinates passed from browser
-      originStr = origin;
-      console.log('Using GPS coordinates as origin:', originStr);
-    } else {
-      originStr = origin;
+    if (!destination) {
+      return res.status(400).json({ success: false, error: 'No destination provided' });
     }
 
+    const GOOGLE_KEY = process.env.GOOGLE_MAPS_KEY;
+
+    const fallbackOrigin = { lat: 34.0522, lng: -118.2437, name: 'Los Angeles, CA' };
+    const start = originCoord || fallbackOrigin;
+
+    let originStr = originCoord
+      ? `${originCoord.lat},${originCoord.lng}`
+      : (origin && origin !== 'home' && origin !== '__AUTO_GPS__' ? String(origin) : 'Los Angeles, CA');
+
+    let destinationStr = destinationCoord
+      ? `${destinationCoord.lat},${destinationCoord.lng}`
+      : String(destination).replace(/\bfrom\s+(my\s+location|current\s+location|me|here)\b/ig, '').trim();
+
     if (GOOGLE_KEY) {
-      // Google Maps route
-      const url = `https://maps.googleapis.com/maps/api/directions/json?origin=${encodeURIComponent(originStr)}&destination=${encodeURIComponent(destination)}&key=${GOOGLE_KEY}&departure_time=now&traffic_model=best_guess`;
+      const url = `https://maps.googleapis.com/maps/api/directions/json?origin=${encodeURIComponent(originStr)}&destination=${encodeURIComponent(destinationStr)}&key=${GOOGLE_KEY}&departure_time=now&traffic_model=best_guess`;
       const resp = await fetch(url);
       const data = await resp.json();
 
       if (data.status === 'OK' && data.routes.length > 0) {
         const route = data.routes[0];
         const leg = route.legs[0];
-        const eta = Math.round(leg.duration_in_traffic?.value / 60 || leg.duration.value / 60);
+        const eta = Math.round((leg.duration_in_traffic?.value || leg.duration.value) / 60);
         const normal = Math.round(leg.duration.value / 60);
         const delay = Math.max(0, eta - normal);
-        const distance = leg.distance.text;
         const trafficLevel = delay > 15 ? 'HEAVY' : delay > 5 ? 'MODERATE' : 'CLEAR';
+        const endLoc = { lat: leg.end_location.lat, lng: leg.end_location.lng };
+        const startLoc = { lat: leg.start_location.lat, lng: leg.start_location.lng };
+        const distanceMiles = leg.distance?.value ? (leg.distance.value / 1609.344).toFixed(1) : '';
+
+        const [gas, parking] = await Promise.all([
+          googleNearby('gas_station', endLoc, GOOGLE_KEY),
+          googleNearby('parking', endLoc, GOOGLE_KEY)
+        ]);
+
+        console.log('Google route OK. Gas:', gas.length, 'Parking:', parking.length);
 
         return res.json({
           success: true,
           route: {
-            destination,
-            origin: originStr,
+            destination: leg.end_address || String(destination),
+            origin: originCoord ? 'Current Location' : (leg.start_address || originStr),
             routes: [{
               label: 'Recommended',
-              description: `${distance} via ${route.summary}`,
+              description: `${leg.distance.text} via ${route.summary || 'best route'}`,
               eta_minutes: eta,
               delay_minutes: delay,
+              distance_miles: distanceMiles,
               traffic_level: trafficLevel,
               polyline: route.overview_polyline.points,
-              start_location: { lat: leg.start_location.lat, lng: leg.start_location.lng },
-              end_location: { lat: leg.end_location.lat, lng: leg.end_location.lng },
+              start_location: startLoc,
+              end_location: endLoc
             }],
             traffic_level: trafficLevel,
-            start_location: { lat: leg.start_location.lat, lng: leg.start_location.lng },
-            end_location: { lat: leg.end_location.lat, lng: leg.end_location.lng },
+            start_location: startLoc,
+            end_location: endLoc
           },
-          gas: [],
-          parking: []
+          gas,
+          parking
         });
       }
-      console.log('Google Maps error:', data.status);
+
+      console.log('Google Maps error:', data.status, data.error_message || '');
     }
 
-    // Fallback: geocode with Nominatim and return straight line route
-    console.log('Using Nominatim fallback geocoding');
-    const geocodeUrl = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(destination)}&format=json&limit=1`;
-    const geoResp = await fetch(geocodeUrl, { headers: { 'User-Agent': 'HALO-AI/1.0' } });
-    const geoData = await geoResp.json();
+    console.log('Using Nominatim/Overpass fallback');
 
-    if (!geoData || geoData.length === 0) {
+    const dest = destinationCoord
+      ? { ...destinationCoord, name: String(destination) }
+      : await geocodeNominatim(destinationStr);
+
+    if (!dest) {
       return res.status(404).json({ success: false, error: `Could not find location: ${destination}` });
     }
 
-    const destLat = parseFloat(geoData[0].lat);
-    const destLng = parseFloat(geoData[0].lon);
-    const destName = geoData[0].display_name.split(',').slice(0, 2).join(',');
+    const startPoint = originCoord || start;
+    const endPoint = { lat: dest.lat, lng: dest.lng };
+    const distMiles = haversineMiles(startPoint, endPoint);
+    const etaMins = Math.max(1, Math.round(distMiles / 0.5));
+    const polyline = encodePolyline([startPoint, endPoint]);
 
-    // Origin coords — use GPS if provided, otherwise LA default
-    let originLat = 34.0522;
-    let originLng = -118.2437;
-    if(originStr && /^-?\d+\.\d+,-?\d+\.\d+$/.test(originStr)){
-      const parts = originStr.split(',');
-      originLat = parseFloat(parts[0]);
-      originLng = parseFloat(parts[1]);
-      console.log('Using GPS origin:', originLat, originLng);
-    }
+    const [gas, parking] = await Promise.all([
+      overpassNearby('gas', endPoint),
+      overpassNearby('parking', endPoint)
+    ]);
 
-    // Estimate distance and ETA
-    const R = 3959; // miles
-    const dLat = (destLat - originLat) * Math.PI / 180;
-    const dLon = (destLng - originLng) * Math.PI / 180;
-    const a = Math.sin(dLat/2)**2 + Math.cos(originLat*Math.PI/180) * Math.cos(destLat*Math.PI/180) * Math.sin(dLon/2)**2;
-    const distMiles = R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
-    const etaMins = Math.round(distMiles / 0.5); // ~30mph average
+    console.log('Fallback route OK. Gas:', gas.length, 'Parking:', parking.length);
 
-    // Create simple polyline (straight line encoded)
-    // Simple encoding of two points
-    function encodeCoord(c) {
-      c = Math.round(c * 1e5);
-      c = c < 0 ? ~(c << 1) : (c << 1);
-      let s = '';
-      while (c >= 0x20) { s += String.fromCharCode((0x20 | (c & 0x1f)) + 63); c >>= 5; }
-      s += String.fromCharCode(c + 63);
-      return s;
-    }
-    const polyline = encodeCoord(originLat) + encodeCoord(originLng) + encodeCoord(destLat - originLat) + encodeCoord(destLng - originLng);
-
-    res.json({
+    return res.json({
       success: true,
       route: {
-        destination: destName,
-        origin: 'Los Angeles, CA',
+        destination: dest.name || String(destination),
+        origin: originCoord ? 'Current Location' : fallbackOrigin.name,
         routes: [{
           label: 'Direct Route',
           description: `${distMiles.toFixed(1)} miles`,
           eta_minutes: etaMins,
           delay_minutes: 0,
+          distance_miles: distMiles.toFixed(1),
           traffic_level: 'CLEAR',
           polyline,
-          start_location: { lat: originLat, lng: originLng },
-          end_location: { lat: destLat, lng: destLng },
+          start_location: { lat: startPoint.lat, lng: startPoint.lng },
+          end_location: { lat: endPoint.lat, lng: endPoint.lng }
         }],
         traffic_level: 'CLEAR',
-        start_location: { lat: originLat, lng: originLng },
-        end_location: { lat: destLat, lng: destLng },
+        start_location: { lat: startPoint.lat, lng: startPoint.lng },
+        end_location: { lat: endPoint.lat, lng: endPoint.lng }
       },
-      gas: [],
-      parking: []
+      gas,
+      parking
     });
 
   } catch (error) {
@@ -604,6 +751,7 @@ app.post('/route-plus', async (req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 });
+
 
 app.get('/', (req, res) => res.send('HALO Server Online'));
 
