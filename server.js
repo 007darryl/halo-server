@@ -606,55 +606,89 @@ app.post('/route-plus', async (req, res) => {
 });
 
 
-// ── HALO IMAGE SEARCH MODULE V69 ──
-// Google Custom Search image endpoint.
+
+// ── HALO IMAGE SEARCH MODULE V71 ──
+// Uses Google Custom Search JSON API.
 // Render env vars supported:
-// GOOGLE_SEARCH_KEY = your API key
-// GOOGLE_SEARCH_ENGINE_ID = your CX id
-// Also supports GOOGLE_SEARCH_ENGINE because your Render variable used that name.
+// GOOGLE_SEARCH_KEY = Search-only API key
+// GOOGLE_SEARCH_ENGINE = 46782cc68dccd4960
+// GOOGLE_SEARCH_ENGINE_ID also supported
 async function haloGoogleImageSearch(req, res) {
   try {
     const query = String(req.query.q || req.query.query || '').trim();
-    const limit = Math.max(1, Math.min(parseInt(req.query.limit || '10', 10), 10));
+    const limit = Math.max(1, Math.min(Number.parseInt(req.query.limit || '10', 10), 10));
 
     if (!query) {
       return res.status(400).json({
         success: false,
-        error: 'Missing image search query. Use ?q=lamborghini'
+        error: 'Missing image search query. Example: /api/images?q=cats'
       });
     }
 
-    const googleKey = process.env.GOOGLE_SEARCH_KEY || process.env.GOOGLE_API_KEY;
-    const searchEngineId =
-      process.env.GOOGLE_SEARCH_ENGINE_ID ||
+    const googleKey = String(process.env.GOOGLE_SEARCH_KEY || '').trim();
+    const searchEngineId = String(
       process.env.GOOGLE_SEARCH_ENGINE ||
-      process.env.GOOGLE_CX;
+      process.env.GOOGLE_SEARCH_ENGINE_ID ||
+      process.env.GOOGLE_CX ||
+      ''
+    ).trim();
 
     if (!googleKey || !searchEngineId) {
       return res.status(500).json({
         success: false,
-        error: 'Missing GOOGLE_SEARCH_KEY or GOOGLE_SEARCH_ENGINE_ID / GOOGLE_SEARCH_ENGINE in Render Environment'
+        error: 'Missing Render env vars. Required: GOOGLE_SEARCH_KEY and GOOGLE_SEARCH_ENGINE'
       });
     }
 
-    const url =
-      'https://www.googleapis.com/customsearch/v1' +
-      `?key=${encodeURIComponent(googleKey)}` +
-      `&cx=${encodeURIComponent(searchEngineId)}` +
-      '&searchType=image' +
-      '&safe=off' +
-      `&num=${limit}` +
-      `&q=${encodeURIComponent(query)}`;
+    const params = new URLSearchParams({
+      key: googleKey,
+      cx: searchEngineId,
+      q: query,
+      searchType: 'image',
+      num: String(limit),
+      safe: 'off',
+      imgSize: req.query.imgSize || 'large'
+    });
 
-    const response = await fetch(url);
-    const data = await response.json();
+    const url = `https://customsearch.googleapis.com/customsearch/v1?${params.toString()}`;
+
+    console.log('=== HALO IMAGE SEARCH V71 ===');
+    console.log('Query:', query);
+    console.log('CX:', searchEngineId);
+    console.log('Key prefix:', googleKey.slice(0, 10) + '...');
+    console.log('URL host:', 'customsearch.googleapis.com');
+
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'HALO-Image-Search/1.0'
+      }
+    });
+
+    const raw = await response.text();
+    let data;
+    try {
+      data = JSON.parse(raw);
+    } catch (e) {
+      console.error('GOOGLE IMAGE SEARCH NON-JSON:', raw.slice(0, 500));
+      return res.status(502).json({
+        success: false,
+        error: 'Google returned non-JSON response',
+        raw: raw.slice(0, 500)
+      });
+    }
 
     if (!response.ok || data.error) {
-      console.error('GOOGLE IMAGE SEARCH ERROR:', JSON.stringify(data.error || data).slice(0, 1000));
+      const googleError = data.error || data;
+      console.error('GOOGLE IMAGE SEARCH ERROR:', JSON.stringify(googleError).slice(0, 1500));
+
       return res.status(response.status || 500).json({
         success: false,
-        error: data.error?.message || 'Google Custom Search failed',
-        details: data.error || data
+        error: googleError.message || 'Google Custom Search failed',
+        reason: googleError.errors?.[0]?.reason || googleError.status || 'unknown',
+        google_status: response.status,
+        details: googleError
       });
     }
 
@@ -671,7 +705,9 @@ async function haloGoogleImageSearch(req, res) {
       }))
       .filter(item => item.image || item.thumbnail);
 
-    res.json({
+    console.log('Images returned:', images.length);
+
+    return res.json({
       success: true,
       query,
       count: images.length,
@@ -681,7 +717,7 @@ async function haloGoogleImageSearch(req, res) {
 
   } catch (error) {
     console.error('IMAGE SEARCH MODULE ERROR:', error);
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
       error: error.message
     });
